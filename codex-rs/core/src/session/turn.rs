@@ -1833,6 +1833,7 @@ async fn run_auto_compact(
                 Arc::clone(sess),
                 step_context,
                 replacement_step_context,
+                client_session,
                 world_state,
                 reason,
                 phase,
@@ -2101,6 +2102,11 @@ async fn run_sampling_request(
                 }
                 CodexErrorDetails::Fatal(_) => return Err(err),
                 _ if is_terminal_sampling_outcome(&err) => return Err(err),
+                _ if client_session.long_rate_limit_retry.is_active()
+                    && !crate::responses_retry::can_retry_during_rate_limit_recovery(&err) =>
+                {
+                    return Err(err);
+                }
                 _ => err,
             },
         };
@@ -3874,6 +3880,18 @@ async fn try_run_sampling_request(
 
     if cancellation_token.is_cancelled() {
         return Err(CodexErr::TurnAborted);
+    }
+
+    if response_completed
+        && outcome.is_ok()
+        && !wait_for_bill_only
+        && !*draining_for_mailbox
+        && !step_context
+            .preempt
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+    {
+        client_session.long_rate_limit_retry.finish_response();
     }
 
     outcome

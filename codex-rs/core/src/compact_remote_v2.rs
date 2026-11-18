@@ -413,7 +413,10 @@ async fn run_remote_compaction_request_v2(
             return Err(CodexErr::TurnAborted);
         }
         match result {
-            Ok(compaction_output) => return Ok(compaction_output),
+            Ok(compaction_output) => {
+                client_session.long_rate_limit_retry.finish_response();
+                return Ok(compaction_output);
+            }
             Err(err)
                 if submitted_audio.is_some_and(|audio| audio.matches_rejection(err.details())) =>
             {
@@ -429,7 +432,8 @@ async fn run_remote_compaction_request_v2(
                     step_context,
                     ResponsesStreamRequest::RemoteCompactionV2,
                 )
-                .await?;
+                .or_cancel(cancellation)
+                .await??;
             }
         }
     }

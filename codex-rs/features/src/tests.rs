@@ -15,6 +15,24 @@ use toml::Table;
 use toml::Value as TomlValue;
 
 #[test]
+fn long_rate_limit_retries_is_a_validated_opt_in_toggle() {
+    let mut features = Features::with_defaults();
+    assert!(!features.enabled(Feature::LongRateLimitRetries));
+    for enabled in [true, false] {
+        let config: FeaturesToml =
+            toml::from_str(&format!("long_rate_limit_retries = {enabled}")).unwrap();
+        features.apply_toml(&config);
+        assert_eq!(features.enabled(Feature::LongRateLimitRetries), enabled);
+    }
+    for invalid in ["1800", "'true'", "{ interval = 1 }"] {
+        assert!(
+            toml::from_str::<FeaturesToml>(&format!("long_rate_limit_retries = {invalid}"))
+                .is_err()
+        );
+    }
+}
+
+#[test]
 fn guardian_transcript_mode_rejects_invalid_values() {
     for input in [
         "[guardianv2]\ntranscript_mode = 'xml'",
