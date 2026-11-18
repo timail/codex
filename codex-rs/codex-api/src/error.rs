@@ -42,6 +42,11 @@ pub enum ApiError {
         message: String,
         retry_after: Option<RetryAfter>,
     },
+    #[error("rate limit exceeded: {message}")]
+    RateLimitExceeded {
+        message: String,
+        retry_after: Option<RetryAfter>,
+    },
     #[error("rate limit: {0}")]
     RateLimit(String),
     #[error("invalid request: {message}")]
@@ -97,6 +102,35 @@ pub(crate) fn parse_terminal_provider_error(
     status: Option<StatusCode>,
 ) -> Option<ApiError> {
     let error = error?;
+    // Inspect the identifying fields before deserializing optional diagnostics. LiteLLM
+    // often puts the classification in `type` and the HTTP status string in `code`.
+    if provider_error_matches(error, &["usage_not_included"]) {
+        return Some(ApiError::UsageNotIncluded);
+    }
+    if provider_error_matches(error, &["budget_reached"]) {
+        return Some(ApiError::SessionBudgetExceeded);
+    }
+    for (kind, scope) in [
+        ("api_key_spend_limit_exceeded", SpendLimitScope::ApiKey),
+        ("project_spend_limit_exceeded", SpendLimitScope::Project),
+        ("organization_spend_limit_exceeded", SpendLimitScope::Organization),
+    ] {
+        if provider_error_matches(error, &[kind]) {
+            return Some(ApiError::SpendLimitExceeded(scope));
+        }
+    }
+    if provider_error_matches(
+        error,
+        &[
+            "insufficient_quota",
+            "credit_balance_exhausted",
+            "organization_usage_limit_exceeded",
+            "usage_limit_reached",
+            "budget_exceeded",
+        ],
+    ) {
+        return Some(ApiError::QuotaExceeded);
+    }
     let code = error.get("code")?.as_str()?;
     let message = error
         .get("message")
@@ -199,6 +233,13 @@ pub(crate) fn parse_terminal_provider_error(
         }),
         _ => None,
     }
+}
+
+pub(crate) fn provider_error_matches(error: &Value, kinds: &[&str]) -> bool {
+    ["code", "type", "litellm_error_type"]
+        .into_iter()
+        .filter_map(|field| error.get(field).and_then(Value::as_str))
+        .any(|kind| kinds.contains(&kind))
 }
 
 impl From<crate::AuthError> for ApiError {

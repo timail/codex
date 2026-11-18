@@ -7,6 +7,7 @@ use crate::common::ResponseEvent;
 use bytes::Bytes;
 use codex_client::StreamResponse;
 use codex_http_client::RetryAfter;
+use codex_http_client::TransportError;
 use codex_protocol::error::SpendLimitScope;
 use codex_protocol::protocol::CodexErrorInfo;
 use futures::StreamExt;
@@ -450,4 +451,354 @@ async fn retryable_failed_response_preserves_advice_before_sse_eof() {
         error.retry_delay(/*retry_count*/ 1),
         Some(Duration::from_secs(2))
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn streamed_terminal_limit_markers_override_rate_limit_status_and_headers() {
+    for field in ["code", "type", "litellm_error_type"] {
+        for marker in [
+            "insufficient_quota",
+            "credit_balance_exhausted",
+            "organization_spend_limit_exceeded",
+            "project_spend_limit_exceeded",
+            "organization_usage_limit_exceeded",
+            "budget_exceeded",
+            "usage_limit_reached",
+            "usage_not_included",
+            "budget_reached",
+        ] {
+            let mut detail = json!({
+                "type": "throttling_error",
+                "code": 429,
+                "plan_type": 42,
+                "headers": {"retry-after": "30"},
+            });
+            detail[field] = marker.into();
+            for payload in [
+                json!({"type": "error", "status": 429, "error": detail}),
+                json!({"type": "response.failed", "response": {"error": detail}}),
+            ] {
+                let event = serde_json::from_value(payload).unwrap();
+                let error =
+                    map_api_error(process_responses_event(event).unwrap_err().into_api_error());
+                assert_eq!(
+                    error.retry_delay(/*retry_count*/ 1),
+                    None,
+                    "{field}={marker}"
+                );
+                let expected = if marker == "budget_reached" {
+                    CodexErrorInfo::SessionBudgetExceeded
+                } else if matches!(marker, "organization_spend_limit_exceeded" | "project_spend_limit_exceeded") {
+                    CodexErrorInfo::SpendLimitExceeded
+                } else {
+                    CodexErrorInfo::UsageLimitExceeded
+                };
+                assert_eq!(error.to_codex_protocol_error(), expected);
+            }
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn streamed_rate_limits_preserve_nested_and_outer_retry_advice() {
+    for detail in [
+        json!({"code": "rate_limit_exceeded"}),
+        json!({"code": "slow_down"}),
+        json!({"type": "throttling_error", "code": "429"}),
+        json!({"type": "rate_limit_error"}),
+        json!({"code": 429}),
+        json!({"status": 429}),
+        json!({"status_code": "429"}),
+    ] {
+        for (headers, seconds) in [
+            (json!({"retry-after": "7"}), 7),
+            (json!({"retry-after": "invalid"}), 11),
+        ] {
+            let mut detail = detail.clone();
+            detail["headers"] = headers;
+            detail["message"] = "Try again in 13 seconds.".into();
+            for payload in [
+                json!({"type": "error", "headers": {"retry-after": "11"}, "error": detail}),
+                json!({"type": "response.failed", "response": {"error": detail}}),
+            ] {
+                let expected_seconds = if payload["type"] == "response.failed" && seconds == 11 {
+                    13
+                } else {
+                    seconds
+                };
+                let event = serde_json::from_value(payload).unwrap();
+                let error =
+                    map_api_error(process_responses_event(event).unwrap_err().into_api_error());
+                assert_eq!(
+                    error.to_codex_protocol_error(),
+                    CodexErrorInfo::RateLimitExceeded
+                );
+                assert_eq!(
+                    error.retry_after(),
+                    RetryAfter::from_delay(Duration::from_secs(expected_seconds))
+                );
+            }
+        }
+    }
+    for field in ["status", "status_code"] {
+        for status in [json!(429), json!("429")] {
+            let mut payload = json!({"type": "error", "error": {"message": "try later"}});
+            payload[field] = status;
+            let event = serde_json::from_value(payload).unwrap();
+            let error = map_api_error(process_responses_event(event).unwrap_err().into_api_error());
+            assert_eq!(
+                error.to_codex_protocol_error(),
+                CodexErrorInfo::RateLimitExceeded
+            );
+            assert_eq!(error.retry_after(), None);
+        }
+    }
+}
+
+#[test]
+fn streamed_rate_limit_classification_does_not_guess_from_message_text() {
+    let detail = json!({"code": "unknown_error", "message": "401 invalid_api_key authentication_error 429 rate_limit_exceeded budget_exceeded 503"});
+    let event = serde_json::from_value(json!({"type": "error", "error": detail})).unwrap();
+    assert!(process_responses_event(event).unwrap().is_none());
+    let event =
+        serde_json::from_value(json!({"type": "response.failed", "response": {"error": detail}}))
+            .unwrap();
+    let error = map_api_error(process_responses_event(event).unwrap_err().into_api_error());
+    assert_eq!(error.to_codex_protocol_error(), CodexErrorInfo::Other);
+}
+
+#[test]
+fn streamed_rate_limit_classification_respects_explicit_nonrate_status_and_code() {
+    for status in [json!(401), json!(503), json!("503")] {
+        let event = serde_json::from_value(json!({
+            "type": "error", "status": status,
+            "error": {"type": "throttling_error", "code": "rate_limit_exceeded"},
+        }))
+        .unwrap();
+        let error = process_responses_event(event).unwrap_err().into_api_error();
+        assert!(matches!(
+            error,
+            ApiError::Transport(TransportError::Http { .. })
+        ));
+    }
+    for code in [json!("server_is_overloaded"), json!("503"), json!(503)] {
+        let event = serde_json::from_value(json!({
+            "type": "error", "status": 429,
+            "error": {"type": "throttling_error", "code": code},
+        }))
+        .unwrap();
+        let result = process_responses_event(event);
+        if code == "server_is_overloaded" {
+            assert!(matches!(result.unwrap_err().into_api_error(), ApiError::ServerOverloaded { .. }));
+        } else {
+            assert!(matches!(
+                result.unwrap_err().into_api_error(),
+                ApiError::Transport(TransportError::Http {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    ..
+                })
+            ));
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn streamed_explicit_http_errors_preserve_status_headers_and_retry_advice() {
+    for status in [400, 401, 403, 404, 408, 422, 500, 503] {
+        for value in [json!(status), json!(status.to_string())] {
+            for field in ["code", "status", "status_code"] {
+                let mut detail = json!({
+                    "message": "provider rejected this request",
+                    "headers": {"Retry-After": "3600", "x-request-id": "sse-request"},
+                });
+                detail[field] = value.clone();
+                for payload in [
+                    json!({"type": "error", "error": detail}),
+                    json!({"type": "response.failed", "response": {"error": detail}}),
+                ] {
+                    let event = serde_json::from_value(payload).unwrap();
+                    let error = process_responses_event(event).unwrap_err().into_api_error();
+                    let ApiError::Transport(TransportError::Http {
+                        status: actual_status,
+                        headers: Some(headers),
+                        body: Some(body),
+                        retry_after,
+                        ..
+                    }) = &error
+                    else {
+                        panic!("expected structured HTTP error, got {error:?}");
+                    };
+                    assert_eq!(actual_status.as_u16(), status);
+                    assert_eq!(headers["x-request-id"], "sse-request");
+                    assert!(body.contains("provider rejected this request"));
+                    assert_eq!(
+                        *retry_after,
+                        RetryAfter::from_delay(Duration::from_secs(3600))
+                    );
+                    let mapped = map_api_error(error);
+                    assert_eq!(
+                        mapped.retry_after(),
+                        RetryAfter::from_delay(Duration::from_secs(3600))
+                    );
+                    assert!(!matches!(
+                        mapped.details(),
+                        codex_protocol::error::CodexErrorDetails::Stream(_)
+                            | codex_protocol::error::CodexErrorDetails::RateLimitExceeded(_)
+                    ));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn streamed_auth_markers_override_rate_limit_status_and_retry_advice() {
+    for (marker, status) in [
+        ("invalid_api_key", 401),
+        ("authentication_error", 401),
+        ("auth_error", 401),
+        ("token_not_found_in_db", 401),
+        ("expired_key", 401),
+        ("permission_error", 403),
+        ("permission_denied", 403),
+        ("key_model_access_denied", 403),
+    ] {
+        for field in ["code", "type", "litellm_error_type"] {
+            let mut detail = json!({
+                "code": "429", "type": "throttling_error",
+                "message": "credential rejected; try again in 1 second",
+                "headers": {"Retry-After": "3600"},
+            });
+            detail[field] = marker.into();
+            for payload in [
+                json!({"type": "error", "status": 429, "error": detail}),
+                json!({"type": "response.failed", "response": {"error": detail}}),
+            ] {
+                let event = serde_json::from_value(payload).unwrap();
+                let error =
+                    map_api_error(process_responses_event(event).unwrap_err().into_api_error());
+                assert_eq!(error.http_status_code_value(), Some(status), "{marker}");
+                assert!(error.retry_after().is_some());
+                assert!(matches!(
+                    error.details(),
+                    codex_protocol::error::CodexErrorDetails::UnexpectedStatus(_)
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn streamed_http_status_classification_rejects_non_http_codes() {
+    for code in [
+        json!("401 invalid"),
+        json!("0401"),
+        json!(401.5),
+        json!(600),
+        json!(-401),
+    ] {
+        let event = serde_json::from_value(json!({
+            "type": "error", "error": {"code": code, "message": "401 authentication_error"},
+        }))
+        .unwrap();
+        assert!(process_responses_event(event).unwrap().is_none());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn streamed_http_errors_end_before_later_completion_or_idle_timeout() {
+    for payload in [
+        json!({"type": "error", "status": 401, "error": {"message": "expired"}}),
+        json!({"type": "error", "status_code": "403", "error": {"message": "denied"}}),
+        json!({"type": "error", "error": {"code": 500, "headers": {"Retry-After": "3600"}}}),
+        json!({"type": "response.failed", "response": {"error": {"code": "invalid_api_key", "type": "authentication_error"}}}),
+    ] {
+        let completed = json!({"type": "response.completed", "response": {"id": "later"}});
+        let bytes = stream::iter([Ok(Bytes::from(format!(
+            "data: {payload}\n\ndata: {completed}\n\n"
+        )))])
+        .chain(stream::pending());
+        let mut stream = spawn_response_stream(
+            StreamResponse {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                bytes: Box::pin(bytes),
+            },
+            Duration::from_secs(60),
+            /*telemetry*/ None,
+            /*turn_state*/ None,
+        );
+        let started = tokio::time::Instant::now();
+        loop {
+            match stream.next().await {
+                Some(Ok(ResponseEvent::RateLimits(_))) => {}
+                Some(Err(ApiError::Transport(TransportError::Http { .. }))) => break,
+                event => panic!("expected structured HTTP error, got {event:?}"),
+            }
+        }
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert!(stream.next().await.is_none());
+    }
+}
+
+#[test]
+fn streamed_terminal_policy_codes_override_transient_rate_limit_fields() {
+    for code in [
+        "cyber_policy",
+        "bio_policy",
+        "misalignment_policy_violation",
+        "invalid_prompt",
+    ] {
+        let detail = json!({"code": code, "type": "throttling_error"});
+        for payload in [
+            json!({"type": "error", "status": 429, "error": detail}),
+            json!({"type": "response.failed", "response": {"error": detail}}),
+        ] {
+            let event = serde_json::from_value(payload).unwrap();
+            let error = map_api_error(process_responses_event(event).unwrap_err().into_api_error());
+            assert_eq!(error.retry_delay(/*retry_count*/ 1), None, "{code}");
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn streamed_limit_errors_end_the_stream_before_later_output_or_idle_timeout() {
+    for error_type in ["budget_exceeded", "usage_not_included", "throttling_error"] {
+        for payload in [
+            json!({"type": "error", "status": 429, "error": {"type": error_type, "code": "429"}}),
+            json!({"type": "response.failed", "response": {"error": {"type": error_type, "code": "429"}}}),
+        ] {
+            let completed = json!({"type": "response.completed", "response": {"id": "later"}});
+            let bytes = stream::iter([Ok(Bytes::from(format!(
+                "data: {payload}\n\ndata: {completed}\n\n"
+            )))])
+            .chain(stream::pending());
+            let mut stream = spawn_response_stream(
+                StreamResponse {
+                    status: StatusCode::OK,
+                    headers: HeaderMap::new(),
+                    bytes: Box::pin(bytes),
+                },
+                Duration::from_secs(60),
+                /*telemetry*/ None,
+                /*turn_state*/ None,
+            );
+            let started = tokio::time::Instant::now();
+            let error = loop {
+                match stream.next().await {
+                    Some(Ok(ResponseEvent::RateLimits(_))) => {}
+                    Some(Err(error)) => break map_api_error(error),
+                    event => panic!("expected a limit error for {error_type}, got {event:?}"),
+                }
+            };
+            let expected = if error_type == "throttling_error" {
+                CodexErrorInfo::RateLimitExceeded
+            } else {
+                CodexErrorInfo::UsageLimitExceeded
+            };
+            assert_eq!(error.to_codex_protocol_error(), expected);
+            assert_eq!(started.elapsed(), Duration::ZERO);
+            assert!(stream.next().await.is_none());
+        }
+    }
 }

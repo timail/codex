@@ -14,7 +14,7 @@ fn test_try_parse_retry_delay() {
         misalignment: None,
     };
 
-    let delay = try_parse_retry_delay(&err);
+    let delay = try_parse_retry_delay(err.message.as_deref().unwrap());
     assert_eq!(delay, Some(Duration::from_millis(28)));
 }
 
@@ -28,7 +28,7 @@ fn test_try_parse_retry_delay_no_delay() {
         resets_at: None,
         misalignment: None,
     };
-    let delay = try_parse_retry_delay(&err);
+    let delay = try_parse_retry_delay(err.message.as_deref().unwrap());
     assert_eq!(delay, Some(Duration::from_secs_f64(1.898)));
 }
 
@@ -42,6 +42,6 @@ fn test_try_parse_retry_delay_azure() {
         resets_at: None,
         misalignment: None,
     };
-    let delay = try_parse_retry_delay(&err);
+    let delay = try_parse_retry_delay(err.message.as_deref().unwrap());
     assert_eq!(delay, Some(Duration::from_secs(35)));
 }

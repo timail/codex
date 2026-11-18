@@ -1,15 +1,25 @@
 //! Classifies failed Responses events and their retry advice.
-//! Only rate-limit codes derive retry delays from plaintext messages.
+//! Only rate-limit errors derive retry delays from plaintext messages.
 
 use crate::error::ApiError;
 use crate::error::parse_terminal_provider_error;
+use crate::error::provider_error_matches;
 use crate::responses_headers::json_headers_to_http_headers;
 use codex_http_client::RetryAfter;
+use codex_http_client::TransportError;
+use http::StatusCode;
 use serde::Deserialize;
 use serde_json::Value;
 use std::time::Duration;
 
-// Keep decoding unused fields: malformed values currently produce a stream error.
+const RATE_LIMIT_ERROR_KINDS: &[&str] = &[
+    "rate_limit_exceeded",
+    "slow_down",
+    "throttling_error",
+    "rate_limit_error",
+];
+
+// For unclassified errors, keep the existing validation of optional diagnostic fields.
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct Error {
@@ -28,36 +38,15 @@ fn retry_after_header(headers: Option<&Value>) -> Option<RetryAfter> {
         .and_then(|headers| RetryAfter::from_headers(&json_headers_to_http_headers(headers)))
 }
 
-/// Classifies recognized statusless error events without treating unknown notifications as failures.
-pub(super) fn parse_error_event(
-    error: Option<&Value>,
-    headers: Option<&Value>,
-) -> Option<ApiError> {
-    if let Some(error) = parse_terminal_provider_error(error, /*status*/ None) {
-        return Some(error);
-    }
-    let error = error?;
-    let code = error.get("code")?.as_str()?;
-    match code {
-        "policy_capacity_unavailable" | "server_is_overloaded" => {
-            let retry_after =
-                retry_after_header(error.get("headers")).or_else(|| retry_after_header(headers));
-            Some(if code == "policy_capacity_unavailable" {
-                ApiError::PolicyCapacityUnavailable { retry_after }
-            } else {
-                ApiError::ServerOverloaded { retry_after }
-            })
-        }
-        _ => None,
-    }
-}
-
 pub(super) fn parse_failed_response(response: Option<Value>) -> ApiError {
     let error = response.as_ref().and_then(|response| response.get("error"));
-    let retry_after_header = retry_after_header(error.and_then(|error| error.get("headers")));
-    if let Some(error) = parse_terminal_provider_error(error, /*status*/ None) {
+    if let Some(error) = parse_error_event(error, /*headers*/ None, /*status*/ None) {
         return error;
     }
+    let retry_after_header = error
+        .and_then(|error| error.get("headers"))
+        .and_then(Value::as_object)
+        .and_then(|headers| RetryAfter::from_headers(&json_headers_to_http_headers(headers)));
     let Some(error) = error.and_then(|error| serde_json::from_value::<Error>(error.clone()).ok())
     else {
         let message = "response.failed event received".to_string();
@@ -77,14 +66,6 @@ pub(super) fn parse_failed_response(response: Option<Value>) -> ApiError {
         Some("server_is_overloaded") => ApiError::ServerOverloaded {
             retry_after: retry_after_header,
         },
-        Some("rate_limit_exceeded" | "slow_down") => {
-            let retry_after = retry_after_header
-                .or_else(|| try_parse_retry_delay(&error).and_then(RetryAfter::from_delay));
-            ApiError::RateLimitExceeded {
-                message: error.message.unwrap_or_default(),
-                retry_after,
-            }
-        }
         _ => ApiError::Retryable {
             message: error.message.unwrap_or_default(),
             retry_after: retry_after_header,
@@ -92,11 +73,158 @@ pub(super) fn parse_failed_response(response: Option<Value>) -> ApiError {
     }
 }
 
-fn try_parse_retry_delay(err: &Error) -> Option<Duration> {
-    let re = rate_limit_regex();
-    if let Some(message) = &err.message
-        && let Some(captures) = re.captures(message)
+/// Normalizes status-bearing and statusless SSE errors without inferring status from prose.
+/// Terminal quota markers take precedence over rate-limit status or retry advice.
+pub(super) fn parse_error_event(
+    error: Option<&Value>,
+    headers: Option<&Value>,
+    status: Option<&Value>,
+) -> Option<ApiError> {
+    if let Some(error) = parse_terminal_provider_error(error, /*status*/ None) {
+        return Some(error);
+    }
+    let statuses = [
+        status,
+        error.and_then(|error| error.get("status")),
+        error.and_then(|error| error.get("status_code")),
+        error.and_then(|error| error.get("code")),
+    ]
+    .map(|value| value.and_then(http_error_status));
+    let http_status = statuses
+        .into_iter()
+        .flatten()
+        .find(|status| matches!(*status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN))
+        .or_else(|| error.and_then(auth_error_status))
+        .or_else(|| {
+            statuses
+                .into_iter()
+                .flatten()
+                .find(|status| *status != StatusCode::TOO_MANY_REQUESTS)
+        });
+    if let Some(status) = http_status {
+        // Preserve structured status and advice instead of hiding hard failures in Stream errors.
+        // Keep this in the SSE parser so HTTP handshake auth recovery and diagnostics are unchanged.
+        let nested_headers = error.and_then(|error| error.get("headers"));
+        let retry_after = [nested_headers, headers]
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_object)
+            .find_map(|headers| RetryAfter::from_headers(&json_headers_to_http_headers(headers)));
+        let mut response_headers = headers
+            .and_then(Value::as_object)
+            .map(json_headers_to_http_headers)
+            .unwrap_or_default();
+        if let Some(headers) = nested_headers.and_then(Value::as_object) {
+            response_headers.extend(json_headers_to_http_headers(headers));
+        }
+        return Some(ApiError::Transport(TransportError::Http {
+            status,
+            url: None,
+            headers: Some(response_headers),
+            body: Some(serde_json::json!({ "error": error }).to_string()),
+            retry_after,
+        }));
+    }
+    if let Some(code @ ("policy_capacity_unavailable" | "server_is_overloaded")) =
+        error.and_then(|error| error.get("code")).and_then(Value::as_str)
     {
+        let retry_after = retry_after_header(error.and_then(|error| error.get("headers")))
+            .or_else(|| retry_after_header(headers));
+        return Some(if code == "policy_capacity_unavailable" {
+            ApiError::PolicyCapacityUnavailable { retry_after }
+        } else {
+            ApiError::ServerOverloaded { retry_after }
+        });
+    }
+    let code = error
+        .and_then(|error| error.get("code"))
+        .filter(|code| !code.is_null());
+    // A coarse error type must not override an explicit non-rate status or provider code.
+    if status.is_some_and(|status| !is_rate_limit_status(status))
+        || code.is_some_and(|code| {
+            !is_rate_limit_status(code)
+                && !code
+                    .as_str()
+                    .is_some_and(|code| RATE_LIMIT_ERROR_KINDS.contains(&code))
+        })
+    {
+        return None;
+    }
+    let is_rate_limit = statuses.contains(&Some(StatusCode::TOO_MANY_REQUESTS))
+        || error.is_some_and(|error| {
+            provider_error_matches(error, RATE_LIMIT_ERROR_KINDS)
+                || error.get("code").is_some_and(is_rate_limit_status)
+        });
+    if !is_rate_limit {
+        return None;
+    }
+    let message = error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let retry_after = [error.and_then(|error| error.get("headers")), headers]
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .find_map(|headers| RetryAfter::from_headers(&json_headers_to_http_headers(headers)))
+        .or_else(|| try_parse_retry_delay(message).and_then(RetryAfter::from_delay));
+    Some(ApiError::RateLimitExceeded {
+        message: message.to_owned(),
+        retry_after,
+    })
+}
+
+fn http_error_status(value: &Value) -> Option<StatusCode> {
+    let status = value
+        .as_u64()
+        .and_then(|value| u16::try_from(value).ok())
+        .and_then(|value| StatusCode::from_u16(value).ok())
+        .or_else(|| {
+            value
+                .as_str()
+                .and_then(|value| StatusCode::from_bytes(value.as_bytes()).ok())
+        })?;
+    (status.is_client_error() || status.is_server_error()).then_some(status)
+}
+
+fn auth_error_status(error: &Value) -> Option<StatusCode> {
+    if provider_error_matches(
+        error,
+        &[
+            "invalid_api_key",
+            "authentication_error",
+            "auth_error",
+            "token_not_found_in_db",
+            "expired_key",
+        ],
+    ) {
+        Some(StatusCode::UNAUTHORIZED)
+    } else if provider_error_matches(
+        error,
+        &[
+            "permission_error",
+            "permission_denied",
+            "key_model_access_denied",
+            "team_model_access_denied",
+            "user_model_access_denied",
+            "org_model_access_denied",
+            "project_model_access_denied",
+            "tool_access_denied",
+        ],
+    ) {
+        Some(StatusCode::FORBIDDEN)
+    } else {
+        None
+    }
+}
+
+fn is_rate_limit_status(value: &Value) -> bool {
+    value.as_u64() == Some(429) || value.as_str() == Some("429")
+}
+
+fn try_parse_retry_delay(message: &str) -> Option<Duration> {
+    let re = rate_limit_regex();
+    if let Some(captures) = re.captures(message) {
         let seconds = captures.get(1);
         let unit = captures.get(2);
 

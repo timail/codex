@@ -12,6 +12,7 @@ use crate::safety_buffering::treatment_from_headers;
 use crate::telemetry::SseTelemetry;
 use codex_client::ByteStream;
 use codex_client::StreamResponse;
+use codex_client::TransportError;
 use codex_protocol::ResponseUsageMetadata;
 use codex_protocol::error::ResponseIncompleteError;
 use codex_protocol::models::ResponseItem;
@@ -169,6 +170,8 @@ pub struct ResponsesStreamEvent {
     response: Option<Value>,
     response_id: Option<Value>,
     error: Option<Value>,
+    #[serde(alias = "status_code")]
+    status: Option<Value>,
     item: Option<Value>,
     item_id: Option<String>,
     call_id: Option<String>,
@@ -402,7 +405,11 @@ pub fn process_responses_event(
 ) -> std::result::Result<Option<ResponseEvent>, ResponsesEventError> {
     match event.kind.as_str() {
         "error" => {
-            if let Some(error) = parse_error_event(event.error.as_ref(), event.headers.as_ref()) {
+            if let Some(error) = parse_error_event(
+                event.error.as_ref(),
+                event.headers.as_ref(),
+                event.status.as_ref(),
+            ) {
                 return Err(ResponsesEventError::Api(error));
             }
         }
