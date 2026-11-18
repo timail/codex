@@ -6,10 +6,12 @@ on:
   push:
     branches: [main]
 
+# Fork: the focused checks live in fork-ci.yml.
 jobs:
   # Keep reusable workflow calls alphabetized. Each child retains its own
   # workflow_dispatch trigger so maintainers can rerun flaky suites directly.
   rust-ci-full:
+    if: github.repository == 'openai/codex'
     permissions:
       contents: read
       id-token: write
@@ -18,6 +20,7 @@ jobs:
     secrets: inherit
 
   v8-canary:
+    if: github.repository == 'openai/codex'
     permissions:
       contents: read
       id-token: write
@@ -30,7 +33,7 @@ jobs:
     needs:
       - rust-ci-full
       - v8-canary
-    if: ${{ always() }}
+    if: ${{ github.repository == 'openai/codex' && always() }}
     runs-on: ubuntu-24.04
     steps:
       # Postmerge runs use the pushed main commit, so this helper always comes

@@ -1,0 +1,81 @@
+name: Fork CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  retry-regression:
+    name: Retry regression
+    if: github.repository != 'openai/codex'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: codex-rs
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      RUST_MIN_STACK: "8388608"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev libcap-dev libasound2-dev
+
+      - name: Install the repository Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Cache Cargo dependency sources
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: fork-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('codex-rs/Cargo.lock', 'codex-rs/rust-toolchain.toml') }}
+          restore-keys: |
+            fork-cargo-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Test feature configuration
+        run: cargo test --locked -p codex-features --lib
+
+      - name: Test terminal retry exhaustion
+        run: cargo test --locked -p codex-protocol --lib rate_limit_recovery_exhaustion_ignores_retry_advice
+
+      - name: Test API error handling
+        run: cargo test --locked -p codex-api --lib
+
+      - name: Test retry behavior with virtual time
+        run: cargo test --locked -p codex-core --lib responses_retry::tests
+
+      - name: Test configuration schema fixture
+        run: cargo test --locked -p codex-core --lib config::schema::tests::config_schema_matches_fixture
+
+      - name: Test recovery, tool results, and interruption
+        run: |
+          if [[ -v CODEX_SANDBOX_NETWORK_DISABLED ]]; then
+            echo '::error::The sandbox guard would skip loopback integration tests.'
+            exit 1
+          fi
+          cargo test --locked -p codex-core --test long_rate_limit_retries -- --nocapture
