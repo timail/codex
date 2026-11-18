@@ -27,6 +27,8 @@ concurrency:
 
 jobs:
   tag-check:
+    # Fork: retain upstream automation without running it here.
+    if: github.repository == 'openai/codex'
     outputs:
       build-systems: >-
         ${{ github.repository == 'openai/codex' && github.ref_protected &&

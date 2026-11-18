@@ -1,3 +1,36 @@
+# Codex with extended 429 retries
+
+A small, unofficial fork of [openai/codex](https://github.com/openai/codex).
+It adds an opt-in fallback for transient provider rate limits: when the normal
+retry path would stop, wait at least 30 minutes between attempts, for up to
+12 additional hours. Longer `Retry-After` values are respected within that
+deadline. This covers normal generation and foreground compaction. Known quota
+and usage-limit errors keep their normal handling.
+
+Build this checkout to use the feature:
+
+```shell
+cd codex-rs
+cargo build --locked --release -p codex-cli --bin codex
+./target/release/codex --enable long_rate_limit_retries
+```
+
+Or enable it in your Codex configuration:
+
+```toml
+[features]
+long_rate_limit_retries = true
+```
+
+The feature is off by default; `--disable long_rate_limit_retries` disables the
+additional waiting window for a run. Cancellation remains available while waiting.
+See [fork maintenance](docs/fork-maintenance.md) for the exact upstream base,
+checks, and vendored Ponytail skills. Build prerequisites are in
+[Installing & building](docs/install.md). The installation instructions below
+install the official upstream release.
+
+---
+
 <p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
 <p align="center">
   <img src="https://github.com/openai/codex/blob/main/.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />
