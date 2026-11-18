@@ -376,6 +376,7 @@ pub struct ModelClient {
 pub struct ModelClientSession {
     client: ModelClient,
     websocket_session: WebsocketSession,
+    pub(crate) long_rate_limit_retry: crate::responses_retry::LongRateLimitRetryState,
     /// Turn state for sticky routing.
     ///
     /// This is an `OnceLock` that stores the turn state value received from the server
@@ -393,6 +394,7 @@ pub struct ModelClientSession {
 /// Executes HTTP Responses requests without owning a turn's WebSocket state.
 pub(crate) struct ResponsesHttpExecutor<'a> {
     client: &'a ModelClient,
+    recovery: Option<&'a crate::responses_retry::LongRateLimitRetryState>,
 }
 
 #[derive(Debug, Clone)]
@@ -822,6 +824,7 @@ impl ModelClient {
         ModelClientSession {
             client: self.clone(),
             websocket_session,
+            long_rate_limit_retry: Default::default(),
             turn_state: Arc::new(OnceLock::new()),
         }
     }
@@ -1740,7 +1743,18 @@ impl ModelClientSession {
 
 impl<'a> ResponsesHttpExecutor<'a> {
     pub(crate) fn new(client: &'a ModelClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            recovery: None,
+        }
+    }
+
+    fn with_rate_limit_recovery(
+        mut self,
+        recovery: &'a crate::responses_retry::LongRateLimitRetryState,
+    ) -> Self {
+        self.recovery = recovery.is_active().then_some(recovery);
+        self
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2106,7 +2120,7 @@ impl ResponsesHttpExecutor<'_> {
         let mut provider_auth_recovery_attempted = false;
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
-            let client_setup = self
+            let mut client_setup = self
                 .client
                 .current_client_setup(ClientRouting::Workspace)
                 .await?;
@@ -2114,6 +2128,9 @@ impl ResponsesHttpExecutor<'_> {
                 Some(owner) != client_setup.auth_owner.as_ref() || !owner.is_current()
             }) {
                 return Err(CodexErr::TurnAborted);
+            }
+            if self.recovery.is_some() {
+                client_setup.api_provider.retry.max_attempts = 0;
             }
             let include_internal = self
                 .client
@@ -2129,7 +2146,10 @@ impl ResponsesHttpExecutor<'_> {
                 &responses_headers,
             );
             tracing::Span::current().record("api.path", "/responses");
-            let transport = client_setup.http_transport("/responses")?;
+            let transport = crate::responses_retry::RateLimitRecoveryTransport {
+                inner: client_setup.http_transport("/responses")?,
+                recovery: self.recovery,
+            };
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
                 client_setup.api_auth.as_ref(),
@@ -2263,11 +2283,12 @@ impl ResponsesHttpExecutor<'_> {
                     });
                 }
                 Err(ApiError::Transport(unauthorized_transport))
-                    if self
-                        .client
-                        .state
-                        .provider
-                        .is_recoverable_auth_error(&unauthorized_transport) =>
+                    if self.recovery.is_none()
+                        && self
+                            .client
+                            .state
+                            .provider
+                            .is_recoverable_auth_error(&unauthorized_transport) =>
                 {
                     let response_debug_context =
                         extract_response_debug_context(&unauthorized_transport);
@@ -2289,6 +2310,9 @@ impl ResponsesHttpExecutor<'_> {
                         .await?,
                     );
                     continue;
+                }
+                Err(ApiError::Transport(TransportError::RetryLimit)) if self.recovery.is_some() => {
+                    return Err(self.recovery.expect("recovery gate expired").exhausted());
                 }
                 Err(err) => {
                     let response_debug_context =
@@ -2840,10 +2864,14 @@ impl ModelClientSession {
         responses_metadata: &CodexResponsesMetadata,
         inference_trace: &InferenceTraceContext,
     ) -> Result<OpenedModelResponse> {
+        let single_attempt = self.long_rate_limit_retry.is_active();
+        self.long_rate_limit_retry.wait_for_retry().await?;
         let wire_api = self.client.state.provider.info().wire_api;
         match wire_api {
             WireApi::Responses => {
-                if self.client.responses_websocket_enabled() {
+                // One HTTP request per recovery slot: neither WebSocket fallback nor lower-level
+                // transport/auth retries may issue a second request before the next slot.
+                if !single_attempt && self.client.responses_websocket_enabled() {
                     let request_trace = current_span_w3c_trace_context();
                     match self
                         .stream_responses_websocket(
@@ -2866,6 +2894,7 @@ impl ModelClientSession {
                 }
 
                 ResponsesHttpExecutor::new(&self.client)
+                    .with_rate_limit_recovery(&self.long_rate_limit_retry)
                     .stream_responses_http(
                         &self.turn_state,
                         /*expected_auth_owner*/ None,

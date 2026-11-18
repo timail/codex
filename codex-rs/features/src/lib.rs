@@ -246,6 +246,8 @@ pub enum Feature {
     EnableRequestCompression,
     /// Keep active sampling turns alive until a failed network connection recovers.
     UnboundedConnectionRetries,
+    /// Recover temporary rate limits for up to twelve hours, with thirty-minute retry spacing.
+    LongRateLimitRetries,
     /// Start the managed network proxy for sandboxed sessions.
     NetworkProxy,
     /// Mask credentials and inject them through an already enabled network proxy.
@@ -1658,6 +1660,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "unbounded_connection_retries",
         stage: Stage::Stable,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::LongRateLimitRetries,
+        key: "long_rate_limit_retries",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::NetworkProxy,

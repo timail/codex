@@ -142,6 +142,9 @@ pub enum CodexErrorDetails {
     /// A retryable upstream rate limit received inside the response stream.
     #[error("rate limit exceeded: {0}")]
     RateLimitExceeded(String),
+    /// The bounded recovery window ended; neither server advice nor model fallback can reopen it.
+    #[error("{0}")]
+    RateLimitRecoveryExhausted(String),
     // The iOS input-limit classifier matches this message's ASCII prefix.
     #[error(
         "Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying."
@@ -436,6 +439,7 @@ impl CodexErr {
         ResponseStreamFailed(error: ResponseStreamFailed),
         ConnectionFailed(error: ConnectionFailedError),
         RetryLimit(error: RetryLimitReachedError),
+        RateLimitRecoveryExhausted(message: String),
         Sandbox(error: SandboxErr),
         UnsupportedOperation(message: String),
         RefreshTokenFailed(error: RefreshTokenFailedError),
@@ -509,6 +513,7 @@ impl CodexErr {
             | CodexErrorDetails::UsageNotIncluded
             | CodexErrorDetails::QuotaExceeded
             | CodexErrorDetails::APISpendLimitExceeded(_)
+            | CodexErrorDetails::RateLimitRecoveryExhausted(_)
             | CodexErrorDetails::InvalidImageRequest()
             | CodexErrorDetails::InvalidRequest(_)
             | CodexErrorDetails::InvalidAudioInput { .. }
@@ -598,6 +603,7 @@ impl CodexErr {
                 CodexErrorInfo::OrganizationSpendLimitExceeded
             }
             CodexErrorDetails::RateLimitExceeded(_) => CodexErrorInfo::RateLimitExceeded,
+            CodexErrorDetails::RateLimitRecoveryExhausted(_) => CodexErrorInfo::Other,
             CodexErrorDetails::UsageLimitReached(_)
             | CodexErrorDetails::QuotaExceeded
             | CodexErrorDetails::UsageNotIncluded => CodexErrorInfo::UsageLimitExceeded,
@@ -1098,6 +1104,19 @@ pub fn get_error_message_ui(e: &CodexErr) -> String {
         &message,
         TruncationPolicy::Bytes(ERROR_MESSAGE_UI_MAX_BYTES),
     )
+}
+
+#[cfg(test)]
+#[test]
+fn rate_limit_recovery_exhaustion_ignores_retry_advice() {
+    let error = CodexErr::RateLimitRecoveryExhausted("last status: 429".to_string());
+    assert!(error.retry_delay(/*retry_count*/ 1).is_none());
+    let error = error
+        .with_retry_after(RetryAfter::from_delay(Duration::from_secs(60)).expect("retry deadline"));
+    assert!(error.retry_after().is_some());
+    assert!(error.retry_delay(/*retry_count*/ 1).is_none());
+    assert!(!error.requires_http_fallback());
+    pretty_assertions::assert_eq!(error.to_codex_protocol_error(), CodexErrorInfo::Other);
 }
 
 #[cfg(test)]
