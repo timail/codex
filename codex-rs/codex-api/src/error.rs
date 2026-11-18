@@ -94,12 +94,59 @@ pub(crate) fn parse_terminal_provider_error(
     status: Option<StatusCode>,
 ) -> Option<ApiError> {
     let error = error?;
+    // Inspect the identifying fields before deserializing optional diagnostics. LiteLLM
+    // often puts the classification in `type` and the HTTP status string in `code`.
+    if provider_error_matches(error, &["usage_not_included"]) {
+        return Some(ApiError::UsageNotIncluded);
+    }
+    if provider_error_matches(error, &["budget_reached"]) {
+        return Some(ApiError::SessionBudgetExceeded);
+    }
+    if provider_error_matches(
+        error,
+        &[
+            "insufficient_quota",
+            "credit_balance_exhausted",
+            "organization_spend_limit_exceeded",
+            "project_spend_limit_exceeded",
+            "organization_usage_limit_exceeded",
+            "usage_limit_reached",
+            "budget_exceeded",
+        ],
+    ) {
+        return Some(ApiError::QuotaExceeded);
+    }
     let code = error.get("code")?.as_str()?;
     let message = error
         .get("message")
         .and_then(Value::as_str)
         .filter(|message| !message.trim().is_empty());
     match (code, status) {
+        ("cyber_policy", None) => Some(ApiError::CyberPolicy {
+            message: message
+                .unwrap_or("This request has been flagged for possible cybersecurity risk.")
+                .to_owned(),
+        }),
+        ("bio_policy", None) => Some(ApiError::BioPolicy {
+            message: message
+                .unwrap_or("This content was flagged for possible biological risk.")
+                .to_owned(),
+        }),
+        ("misalignment_policy_violation", None) => Some(ApiError::MisalignmentPolicyViolation {
+            message: message
+                .unwrap_or("This request was blocked due to a misalignment policy violation.")
+                .to_owned(),
+            misalignment: error.get("misalignment").cloned().and_then(|details| {
+                serde_json::from_value::<MisalignmentErrorDetails>(details).ok()
+            }),
+        }),
+        ("invalid_prompt", None) => Some(ApiError::InvalidPrompt {
+            message: error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Invalid request.")
+                .to_owned(),
+        }),
         ("inference_hook_denied", None | Some(StatusCode::FORBIDDEN)) => {
             Some(ApiError::InferenceHookDenied {
                 message: message
@@ -132,9 +179,6 @@ pub(crate) fn parse_terminal_provider_error(
                 .unwrap_or("The requested access program is not enabled.")
                 .to_owned(),
         }),
-        ("budget_reached", None | Some(StatusCode::BAD_REQUEST)) => {
-            Some(ApiError::SessionBudgetExceeded)
-        }
         (
             "audio_too_large"
             | "audio_too_short"
@@ -159,6 +203,13 @@ pub(crate) fn parse_terminal_provider_error(
         }),
         _ => None,
     }
+}
+
+pub(crate) fn provider_error_matches(error: &Value, kinds: &[&str]) -> bool {
+    ["code", "type", "litellm_error_type"]
+        .into_iter()
+        .filter_map(|field| error.get(field).and_then(Value::as_str))
+        .any(|kind| kinds.contains(&kind))
 }
 
 impl From<crate::AuthError> for ApiError {

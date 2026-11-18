@@ -1,6 +1,7 @@
 use crate::TransportError;
 use crate::error::ApiError;
 use crate::error::parse_terminal_provider_error;
+use crate::error::provider_error_matches;
 use crate::rate_limits::parse_promo_message;
 use crate::rate_limits::parse_rate_limit_for_limit;
 use crate::rate_limits::parse_rate_limit_reached_type;
@@ -17,7 +18,6 @@ use codex_protocol::error::UnexpectedResponseError;
 use codex_protocol::error::UsageLimitReachedError;
 use codex_protocol::protocol::MisalignmentErrorDetails;
 use http::HeaderMap;
-use serde::Deserialize;
 use serde_json::Value;
 
 pub fn map_api_error(err: ApiError) -> CodexErr {
@@ -138,6 +138,12 @@ fn map_api_error_details(err: ApiError) -> CodexErr {
                 let body_text = body.unwrap_or_default();
                 let parsed_body = serde_json::from_str::<Value>(&body_text).ok();
                 let provider_error = parsed_body.as_ref().and_then(|body| body.get("error"));
+                if status == http::StatusCode::TOO_MANY_REQUESTS
+                    && let Some(error) = provider_error
+                    && provider_error_matches(error, &["usage_limit_reached"])
+                {
+                    return map_usage_limit_error(error, headers.as_ref());
+                }
                 if let Some(error) = parse_terminal_provider_error(provider_error, Some(status)) {
                     return map_api_error_details(error);
                 }
@@ -223,56 +229,6 @@ fn map_api_error_details(err: ApiError) -> CodexErr {
                 } else if status == http::StatusCode::INTERNAL_SERVER_ERROR {
                     CodexErr::InternalServerError
                 } else if status == http::StatusCode::TOO_MANY_REQUESTS {
-                    if let Ok(err) = serde_json::from_str::<UsageErrorResponse>(&body_text) {
-                        if err.error.error_type.as_deref() == Some("usage_limit_reached") {
-                            let limit_id = extract_header(headers.as_ref(), ACTIVE_LIMIT_HEADER);
-                            let promo_message = headers.as_ref().and_then(parse_promo_message);
-                            let rate_limit_reached_type =
-                                headers.as_ref().and_then(parse_rate_limit_reached_type);
-                            let rate_limits = headers
-                                .as_ref()
-                                .and_then(|map| {
-                                    parse_rate_limit_for_limit(map, limit_id.as_deref())
-                                })
-                                .map(|mut snapshot| {
-                                    snapshot.rate_limit_reached_type = rate_limit_reached_type;
-                                    snapshot
-                                });
-                            let resets_at = err
-                                .error
-                                .resets_at
-                                .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0));
-                            return CodexErr::UsageLimitReached(UsageLimitReachedError {
-                                plan_type: err.error.plan_type,
-                                resets_at,
-                                limit_window_minutes: err
-                                    .error
-                                    .limit_window_minutes
-                                    .as_ref()
-                                    .and_then(Value::as_u64)
-                                    .and_then(|minutes| u16::try_from(minutes).ok()),
-                                rate_limits: rate_limits.map(Box::new),
-                                promo_message,
-                                rate_limit_reached_type,
-                            });
-                        } else if err.error.error_type.as_deref() == Some("usage_not_included") {
-                            return CodexErr::UsageNotIncluded;
-                        } else if err.error.error_type.as_deref() == Some("insufficient_quota")
-                            || matches!(
-                                err.error.code.as_deref(),
-                                Some(
-                                    "insufficient_quota"
-                                        | "credit_balance_exhausted"
-                                        | "organization_spend_limit_exceeded"
-                                        | "project_spend_limit_exceeded"
-                                        | "organization_usage_limit_exceeded"
-                                )
-                            )
-                        {
-                            return CodexErr::QuotaExceeded;
-                        }
-                    }
-
                     CodexErr::RetryLimit(RetryLimitReachedError {
                         status,
                         request_id: extract_request_tracking_id(headers.as_ref()),
@@ -394,17 +350,31 @@ fn extract_x_error_json_code(headers: Option<&HeaderMap>) -> Option<String> {
         .map(str::to_string)
 }
 
-#[derive(Debug, Deserialize)]
-struct UsageErrorResponse {
-    error: UsageErrorBody,
-}
-
-#[derive(Debug, Deserialize)]
-struct UsageErrorBody {
-    code: Option<String>,
-    #[serde(rename = "type")]
-    error_type: Option<String>,
-    plan_type: Option<PlanType>,
-    resets_at: Option<i64>,
-    limit_window_minutes: Option<Value>,
+fn map_usage_limit_error(error: &Value, headers: Option<&HeaderMap>) -> CodexErr {
+    let limit_id = extract_header(headers, ACTIVE_LIMIT_HEADER);
+    let promo_message = headers.and_then(parse_promo_message);
+    let rate_limit_reached_type = headers.and_then(parse_rate_limit_reached_type);
+    let rate_limits = headers
+        .and_then(|map| parse_rate_limit_for_limit(map, limit_id.as_deref()))
+        .map(|mut snapshot| {
+            snapshot.rate_limit_reached_type = rate_limit_reached_type;
+            snapshot
+        });
+    CodexErr::UsageLimitReached(UsageLimitReachedError {
+        plan_type: error
+            .get("plan_type")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<PlanType>(value).ok()),
+        resets_at: error
+            .get("resets_at")
+            .and_then(Value::as_i64)
+            .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0)),
+        limit_window_minutes: error
+            .get("limit_window_minutes")
+            .and_then(Value::as_u64)
+            .and_then(|minutes| u16::try_from(minutes).ok()),
+        rate_limits: rate_limits.map(Box::new),
+        promo_message,
+        rate_limit_reached_type,
+    })
 }

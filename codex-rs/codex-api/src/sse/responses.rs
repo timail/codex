@@ -1,3 +1,4 @@
+use super::responses_error::parse_error_event;
 use super::responses_error::parse_failed_response;
 use crate::common::ReasoningRemovalReason;
 use crate::common::ResponseEvent;
@@ -5,13 +6,13 @@ use crate::common::ResponseStream;
 use crate::common::SafetyBuffering;
 use crate::common::SafetyBufferingTreatment;
 use crate::error::ApiError;
-use crate::error::parse_terminal_provider_error;
 use crate::guardian_assessment::parse_guardian_assessment;
 use crate::rate_limits::parse_all_rate_limits;
 use crate::safety_buffering::treatment_from_headers;
 use crate::telemetry::SseTelemetry;
 use codex_client::ByteStream;
 use codex_client::StreamResponse;
+use codex_client::TransportError;
 use codex_protocol::ResponseUsageMetadata;
 use codex_protocol::error::ResponseIncompleteError;
 use codex_protocol::models::ResponseItem;
@@ -169,6 +170,8 @@ pub struct ResponsesStreamEvent {
     response: Option<Value>,
     response_id: Option<Value>,
     error: Option<Value>,
+    #[serde(alias = "status_code")]
+    status: Option<Value>,
     item: Option<Value>,
     item_id: Option<String>,
     call_id: Option<String>,
@@ -402,9 +405,11 @@ pub fn process_responses_event(
 ) -> std::result::Result<Option<ResponseEvent>, ResponsesEventError> {
     match event.kind.as_str() {
         "error" => {
-            if let Some(error) =
-                parse_terminal_provider_error(event.error.as_ref(), /*status*/ None)
-            {
+            if let Some(error) = parse_error_event(
+                event.error.as_ref(),
+                event.headers.as_ref(),
+                event.status.as_ref(),
+            ) {
                 return Err(ResponsesEventError::Api(error));
             }
         }
@@ -706,8 +711,16 @@ async fn process_sse_with_treatment(
                 let error = error.into_api_error();
                 if matches!(
                     error,
-                    ApiError::FlexUnavailable
+                    ApiError::Transport(TransportError::Http { .. })
+                        | ApiError::FlexUnavailable
                         | ApiError::ContextWindowExceeded
+                        | ApiError::QuotaExceeded
+                        | ApiError::UsageNotIncluded
+                        | ApiError::RateLimitExceeded { .. }
+                        | ApiError::CyberPolicy { .. }
+                        | ApiError::BioPolicy { .. }
+                        | ApiError::MisalignmentPolicyViolation { .. }
+                        | ApiError::InvalidPrompt { .. }
                         | ApiError::InvalidRequest { .. }
                         | ApiError::SessionBudgetExceeded
                         | ApiError::InferenceHookDenied { .. }

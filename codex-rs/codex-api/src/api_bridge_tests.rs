@@ -613,6 +613,85 @@ fn map_api_error_distinguishes_http_quota_errors_from_rate_limits() {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn http_terminal_limit_markers_override_retry_advice_and_malformed_details() {
+    let advice = RetryAfter::from_delay(std::time::Duration::from_secs(30));
+    for field in ["code", "type", "litellm_error_type"] {
+        for marker in [
+            "insufficient_quota",
+            "credit_balance_exhausted",
+            "organization_spend_limit_exceeded",
+            "project_spend_limit_exceeded",
+            "organization_usage_limit_exceeded",
+            "budget_exceeded",
+            "usage_limit_reached",
+            "usage_not_included",
+            "budget_reached",
+        ] {
+            let mut detail = serde_json::json!({
+                "type": "throttling_error",
+                "code": 429,
+                "plan_type": 42,
+                "resets_at": "invalid",
+            });
+            detail[field] = marker.into();
+            for status in [
+                http::StatusCode::TOO_MANY_REQUESTS,
+                http::StatusCode::UNPROCESSABLE_ENTITY,
+            ] {
+                let error = map_api_error(ApiError::Transport(TransportError::Http {
+                    status,
+                    url: None,
+                    headers: None,
+                    body: Some(serde_json::json!({"error": detail}).to_string()),
+                    retry_after: advice,
+                }));
+                let expected = if marker == "budget_reached" {
+                    CodexErrorInfo::SessionBudgetExceeded
+                } else {
+                    CodexErrorInfo::UsageLimitExceeded
+                };
+                assert_eq!(
+                    error.to_codex_protocol_error(),
+                    expected,
+                    "{field}={marker}"
+                );
+                assert_eq!(error.retry_delay(/*retry_count*/ 1), None);
+            }
+        }
+    }
+}
+
+#[test]
+fn http_usage_limit_keeps_valid_details_when_another_field_is_malformed() {
+    let error = map_api_error(ApiError::Transport(TransportError::Http {
+        status: http::StatusCode::TOO_MANY_REQUESTS,
+        url: None,
+        headers: None,
+        body: Some(
+            serde_json::json!({"error": {
+                "type": "usage_limit_reached",
+                "code": 429,
+                "plan_type": 42,
+                "resets_at": 1_800_000_000,
+                "limit_window_minutes": 60,
+            }})
+            .to_string(),
+        ),
+        retry_after: None,
+    }));
+    let CodexErrorDetails::UsageLimitReached(details) = error.details() else {
+        panic!("expected a usage limit, got {error:?}");
+    };
+    assert_eq!(details.plan_type, None);
+    assert_eq!(
+        details.resets_at.map(|reset| reset.timestamp()),
+        Some(1_800_000_000)
+    );
+    assert_eq!(details.limit_window_minutes, Some(60));
+    assert_eq!(error.retry_delay(/*retry_count*/ 1), None);
+}
+
 #[test]
 fn map_api_error_preserves_optional_usage_limit_window() {
     let cases = [
