@@ -3,7 +3,19 @@
 This is a small patch series over [openai/codex](https://github.com/openai/codex).
 The initial upstream base is
 [`18352dc4e8757d652e4102a17abc76601847b8da`](https://github.com/openai/codex/commit/18352dc4e8757d652e4102a17abc76601847b8da).
-It is a development revision, not a promise of stable-release compatibility.
+The current upstream base is
+[`d1d1ba0b837d34f314b7f469896e8babbc91f949`](https://github.com/openai/codex/commit/d1d1ba0b837d34f314b7f469896e8babbc91f949)
+(19 November 2026). It includes the 79 upstream commits after the archive base,
+including immediate SSE error delivery, scoped API spend-limit errors and the
+latest sandbox permission fixes. The archive series was first reapplied to its
+exact base and its tree matched `28441e415f5c859378a68aa0c5d49f365951e2fb`.
+Both bases are development revisions, not a promise of stable-release compatibility.
+
+At publication, the latest stable release was
+[`rust-v0.170.0`](https://github.com/openai/codex/releases/tag/rust-v0.170.0).
+The public advisory [GHSA-w5fx-fh39-j5rw](https://github.com/openai/codex/security/advisories/GHSA-w5fx-fh39-j5rw)
+was fixed in 0.39.0; that fix predates this base. Reviewing public advisories and
+release notes is not a guarantee that every vulnerability is known.
 Keep the retry change separate from repository documentation and CI changes so
 that either can be reviewed or replayed independently.
 
@@ -34,7 +46,9 @@ A response already in flight may finish.
 
 ## Review and update upstream
 
-1. Add an `upstream` remote pointing to `https://github.com/openai/codex.git` if
+1. Review upstream releases and security advisories weekly and before updating
+   your installed binary. This is a manual maintenance cadence, not an auto-merge.
+   Add an `upstream` remote pointing to `https://github.com/openai/codex.git` if
    needed, then fetch its branches and tags. Review upstream release notes and
    security fixes. Prefer a suitable stable release for the next base; take a
    development revision only when the patch needs it, and record its exact SHA.
@@ -59,7 +73,8 @@ A response already in flight may finish.
 protocol, and feature tests. It uses read-only repository permissions, a pinned checkout
 action, a time limit, and concurrency cancellation. It caches Cargo dependency
 sources using the same pinned cache action as upstream. It needs no repository
-secrets and does not publish releases. A successful run does not establish
+secrets and does not publish releases. It also tests the portable launcher and
+builds the real CLI to verify flag overrides, resume parsing, and shared configuration. A successful run does not establish
 macOS/Windows support or validate a live provider.
 
 Run the same checks locally from `codex-rs`:
@@ -73,6 +88,8 @@ cargo test --locked -p codex-api --lib
 cargo test --locked -p codex-core --lib responses_retry::tests
 cargo test --locked -p codex-core --lib config::schema::tests::config_schema_matches_fixture
 cargo test --locked -p codex-core --test long_rate_limit_retries -- --nocapture
+cargo build --locked -p codex-cli --bin codex --target-dir target
+python3 ../scripts/test-codex-prolong.py target/debug/codex
 ```
 
 The integration cases must actually run against their loopback servers. If the

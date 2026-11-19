@@ -18,7 +18,7 @@ jobs:
     name: Retry regression
     if: github.repository != 'openai/codex'
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 120
     defaults:
       run:
         working-directory: codex-rs
@@ -27,6 +27,7 @@ jobs:
       CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
       RUST_MIN_STACK: "8388608"
     steps:
@@ -38,7 +39,7 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config libssl-dev libcap-dev libasound2-dev
+            build-essential pkg-config libssl-dev libcap-dev libasound2-dev cmake clang python3
 
       - name: Install the repository Rust toolchain
         run: rustup show active-toolchain
@@ -56,6 +57,9 @@ jobs:
           key: fork-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('codex-rs/Cargo.lock', 'codex-rs/rust-toolchain.toml') }}
           restore-keys: |
             fork-cargo-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Test portable launcher
+        run: python3 ../scripts/test-codex-prolong.py
 
       - name: Test feature configuration
         run: cargo test --locked -p codex-features --lib
@@ -79,3 +83,8 @@ jobs:
             exit 1
           fi
           cargo test --locked -p codex-core --test long_rate_limit_retries -- --nocapture
+
+      - name: Build CLI and verify shared configuration
+        run: |
+          cargo build --locked -p codex-cli --bin codex --target-dir target
+          python3 ../scripts/test-codex-prolong.py target/debug/codex

@@ -1,114 +1,68 @@
-# Codex with extended 429 retries
+# Codex Prolong
 
 A small, unofficial fork of [openai/codex](https://github.com/openai/codex).
-It adds an opt-in fallback for transient provider rate limits: when the normal
-retry path would stop, wait at least 30 minutes between attempts, for up to
-12 additional hours. Longer `Retry-After` values are respected within that
-deadline. This covers normal generation and foreground compaction. Known quota
-and usage-limit errors keep their normal handling.
+After ordinary retries stop on a transient HTTP 429 or structured SSE rate limit,
+`codex-prolong` retries at least 30 minutes apart for up to 12 additional hours.
+It respects longer `Retry-After`, supports cancellation, and keeps the same turn
+and completed tool results. Generation and foreground compaction are covered;
+known authentication, quota, budget and policy errors remain terminal.
 
-Build this checkout to use the feature:
+## Install alongside Codex (Linux)
 
-```shell
-cd codex-rs
-cargo build --locked --release -p codex-cli --bin codex
-./target/release/codex --enable long_rate_limit_retries
+Ubuntu/Debian build dependencies (other distributions need equivalent packages):
+
+```sh
+sudo apt-get update
+sudo apt-get install -y build-essential pkg-config libssl-dev libcap-dev \
+  libasound2-dev cmake clang python3 git curl ca-certificates
 ```
 
-Or enable it in your Codex configuration:
+Use an existing [rustup](https://rust-lang.github.io/rustup/installation/index.html)
+installation, or download and inspect its official installer before running it:
 
-```toml
-[features]
-long_rate_limit_retries = true
+```sh
+curl --proto '=https' --tlsv1.2 -fsS https://sh.rustup.rs -o rustup-init.sh
+less rustup-init.sh
+sh rustup-init.sh --profile minimal --no-modify-path --default-toolchain none
 ```
 
-The feature is off by default; `--disable long_rate_limit_retries` disables the
-additional waiting window for a run. Cancellation remains available while waiting.
-See [fork maintenance](docs/fork-maintenance.md) for the exact upstream base,
-checks, and vendored Ponytail skills. Build prerequisites are in
-[Installing & building](docs/install.md). The installation instructions below
-install the official upstream release.
+Build with the toolchain pinned in `codex-rs/rust-toolchain.toml`:
 
----
-
-<p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
-<p align="center">
-  <img src="https://github.com/openai/codex/blob/main/.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />
-</p>
-</br>
-If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="https://developers.openai.com/codex/ide">install in your IDE.</a>
-</br>If you want the desktop app experience, run <code>codex app</code> or visit <a href="https://chatgpt.com/codex?app-landing-page=true">the Codex App page</a>.
-</br>If you are looking for the <em>cloud-based agent</em> from OpenAI, <strong>Codex Web</strong>, go to <a href="https://chatgpt.com/codex">chatgpt.com/codex</a>.</p>
-
----
-
-## Quickstart
-
-### Installing and running Codex CLI
-
-Run the following on Mac or Linux to install Codex CLI:
-
-```shell
-curl -fsSL https://chatgpt.com/codex/install.sh | sh
+```sh
+git clone --branch main --single-branch https://github.com/timail/codex.git codex-prolong-src
+cd codex-prolong-src/codex-rs
+"$HOME/.cargo/bin/cargo" build --locked --release -p codex-cli --bin codex --target-dir target
+cd ..
+python3 scripts/test-codex-prolong.py codex-rs/target/release/codex
+install -d "$HOME/.local/lib/codex-prolong" "$HOME/.local/bin"
+install -m 755 codex-rs/target/release/codex "$HOME/.local/lib/codex-prolong/codex"
+install -m 755 scripts/codex-prolong "$HOME/.local/bin/codex-prolong"
+"$HOME/.local/bin/codex-prolong" features list
+"$HOME/.local/bin/codex-prolong" resume --last
 ```
 
-Run the following on Windows to install Codex CLI:
+The build downloads substantial dependencies. The explicit `--target-dir` fixes
+the binary path even if `CARGO_TARGET_DIR` is set. If `~/.local/bin` is already on
+your `PATH`, use `codex-prolong` directly; otherwise use its full path above.
+No `PATH` change or replacement of the existing `codex` is needed.
 
-```shell
-powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"
-```
+The wrapper runs the separate binary with `--enable long_rate_limit_retries`
+and forwards all arguments, including `exec` and `resume`. Both commands use the
+same ordinary `~/.codex/config.toml`, authentication and sessions. An existing
+`CODEX_HOME` override is passed through unchanged; use the same value for both
+commands and ensure that directory exists. Existing LiteLLM settings and token
+sources are reused. Keep the feature out of the shared config: the wrapper enables
+it only for its own process. Use `codex-prolong --disable long_rate_limit_retries`
+to disable the extra waiting for one invocation.
 
-The standalone installers download from `https://releases.openai.com/codex` by default and fall back to GitHub Releases if a metadata or asset download is unavailable. To force GitHub Releases, set `CODEX_INSTALLER_USE_RELEASES_OPENAI_COM` to `false` (`0` and `no` are also accepted):
+## Update and verify
 
-```shell
-curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_INSTALLER_USE_RELEASES_OPENAI_COM=false sh
-```
+In a clean checkout, run `git pull --ff-only origin main`, then repeat the build,
+smoke test and two `install -m 755` commands above. `features list` must show
+`long_rate_limit_retries` as `true` through the wrapper. Run the local 429 tests
+and follow the manual upstream/security update procedure in
+[maintenance](docs/fork-maintenance.md); they use virtual time and loopback
+servers, without real provider tokens or a 12-hour wait.
 
-```powershell
-$env:CODEX_INSTALLER_USE_RELEASES_OPENAI_COM='false'; irm https://chatgpt.com/codex/install.ps1 | iex
-```
-
-Codex CLI can also be installed via the following package managers:
-
-```shell
-# Install using npm
-npm install -g @openai/codex
-```
-
-```shell
-# Install using Homebrew
-brew install --cask codex
-```
-
-Then simply run `codex` to get started.
-
-<details>
-<summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
-
-Each GitHub Release contains many executables, but in practice, you likely want one of these:
-
-- macOS
-  - Apple Silicon/arm64: `codex-aarch64-apple-darwin.tar.gz`
-  - x86_64 (older Mac hardware): `codex-x86_64-apple-darwin.tar.gz`
-- Linux
-  - x86_64: `codex-x86_64-unknown-linux-musl.tar.gz`
-  - arm64: `codex-aarch64-unknown-linux-musl.tar.gz`
-
-Each archive contains a single entry with the platform baked into the name (e.g., `codex-x86_64-unknown-linux-musl`), so you likely want to rename it to `codex` after extracting it.
-
-</details>
-
-### Using Codex with your ChatGPT plan
-
-Run `codex` and select **Sign in with ChatGPT**. We recommend signing into your ChatGPT account to use Codex as part of your Plus, Pro, Business, Edu, or Enterprise plan. [Learn more about what's included in your ChatGPT plan](https://help.openai.com/en/articles/11369540-codex-in-chatgpt).
-
-You can also use Codex with an API key, but this requires [additional setup](https://developers.openai.com/codex/auth#sign-in-with-an-api-key).
-
-## Docs
-
-- [**Codex Documentation**](https://developers.openai.com/codex)
-- [**Contributing**](./docs/contributing.md)
-- [**Installing & building**](./docs/install.md)
-- [**Open source fund**](./docs/open-source-fund.md)
-
-This repository is licensed under the [Apache-2.0 License](LICENSE).
+[Upstream README](docs/upstream-README.md) is preserved for reference.
+[Apache-2.0](LICENSE); the two vendored Ponytail skills retain their MIT license.

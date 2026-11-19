@@ -1,0 +1,3 @@
+#!/bin/sh
+# Keep the real executable named codex for its internal helper dispatch.
+exec "$HOME/.local/lib/codex-prolong/codex" --enable long_rate_limit_retries "$@"
