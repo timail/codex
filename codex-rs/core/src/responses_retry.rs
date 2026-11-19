@@ -1,7 +1,8 @@
 //! Shared retry and transport fallback decisions for Responses requests.
 //! Content-filter guidance is recorded for sampling requests before retry decisions.
-//! Server advice controls timing without extending configured retry limits.
+//! Server advice controls timing. Optional long rate-limit recovery has a separate bounded window.
 
+use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::client::ModelClientSession;
@@ -12,7 +13,12 @@ use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
 use codex_client::RetryOperation;
 use codex_features::Feature;
+use codex_http_client::HttpTransport;
+use codex_http_client::Request;
+use codex_http_client::Response;
 use codex_http_client::RetryAfter;
+use codex_http_client::StreamResponse;
+use codex_http_client::TransportError;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::protocol::EventMsg;
@@ -22,6 +28,188 @@ use tracing::warn;
 
 const INITIAL_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(5);
 const MAX_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(60);
+const LONG_RATE_LIMIT_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const LONG_RATE_LIMIT_RETRY_WINDOW: Duration = Duration::from_secs(12 * 60 * 60);
+
+/// Recovery state for one continuous outage. A fully successful foreground response resets it.
+/// Keeping the gate on the client session also prevents same-turn steering from skipping a wait.
+#[derive(Default)]
+pub(crate) struct LongRateLimitRetryState {
+    deadline: Option<Instant>,
+    not_before: Mutex<Option<Instant>>,
+    last_error: Option<String>,
+}
+
+impl LongRateLimitRetryState {
+    pub(crate) fn is_active(&self) -> bool {
+        self.deadline.is_some()
+    }
+
+    pub(crate) fn schedule_if_needed(
+        &mut self,
+        err: &CodexErr,
+        enabled: bool,
+        normal_retry_available: bool,
+    ) -> Option<Instant> {
+        if (self.is_active()
+            || (enabled && is_temporary_rate_limit(err) && !normal_retry_available))
+            && can_retry_during_rate_limit_recovery(err)
+        {
+            Some(self.schedule_retry(err))
+        } else {
+            None
+        }
+    }
+
+    fn schedule_retry(&mut self, err: &CodexErr) -> Instant {
+        let now = Instant::now();
+        let deadline = *self
+            .deadline
+            .get_or_insert(now + LONG_RATE_LIMIT_RETRY_WINDOW);
+        let not_before = self
+            .not_before
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let retry_at = (now + LONG_RATE_LIMIT_RETRY_INTERVAL)
+            .max(not_before.unwrap_or(now))
+            .max(err.retry_after().map(RetryAfter::deadline).unwrap_or(now));
+        *not_before = Some(retry_at);
+        self.last_error = Some(err.to_string());
+        // A longer Retry-After exhausts the window without sleeping past it or retrying early.
+        retry_at.min(deadline)
+    }
+
+    pub(crate) async fn wait_for_retry(&self) -> Result<(), CodexErr> {
+        let Some(retry_at) = *self
+            .not_before
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        else {
+            return Ok(());
+        };
+        let deadline = self.deadline.expect("active recovery has a deadline");
+        if Instant::now() > deadline {
+            return Err(self.exhausted());
+        }
+        let wake_at = retry_at.min(deadline);
+        if Instant::now() < wake_at {
+            tokio::time::sleep_until(wake_at).await;
+        }
+        // An attempt exactly on the horizon is permitted; no request may start after it.
+        if retry_at > deadline || Instant::now() > deadline {
+            return Err(self.exhausted());
+        }
+        Ok(())
+    }
+
+    /// Reserves one request slot before dispatch. A preempted request cannot free its slot.
+    async fn before_attempt(&self) -> Result<(), CodexErr> {
+        loop {
+            self.wait_for_retry().await?;
+            let mut not_before = self
+                .not_before
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let now = Instant::now();
+            if self.deadline.is_some_and(|deadline| now > deadline) {
+                return Err(self.exhausted());
+            }
+            if not_before.is_some_and(|retry_at| retry_at > now) {
+                continue;
+            }
+            if self.is_active() {
+                *not_before = Some(now + LONG_RATE_LIMIT_RETRY_INTERVAL);
+            }
+            return Ok(());
+        }
+    }
+
+    pub(crate) async fn wait_after_error(
+        &self,
+        sess: &Session,
+        turn_context: &TurnContext,
+        err: CodexErr,
+        retry_at: Instant,
+    ) -> Result<(), CodexErr> {
+        let delay = retry_at.saturating_duration_since(Instant::now());
+        sess.notify_stream_error(
+            turn_context,
+            format!(
+                "Rate-limit recovery: waiting {}s (30-minute minimum, 12-hour window)",
+                delay.as_secs()
+            ),
+            err,
+        )
+        .await;
+        self.wait_for_retry().await
+    }
+
+    pub(crate) fn finish_response(&mut self) {
+        *self = Self::default();
+    }
+
+    pub(crate) fn exhausted(&self) -> CodexErr {
+        CodexErrorDetails::RateLimitRecoveryExhausted(format!(
+            "Long rate-limit retry window exhausted after 12 hours. Last error: {}",
+            self.last_error.as_deref().unwrap_or("rate limit exceeded")
+        ))
+        .into()
+    }
+}
+
+/// Gate after async credential preparation, immediately before transport dispatch.
+pub(crate) struct RateLimitRecoveryTransport<'a, T> {
+    pub(crate) inner: T,
+    pub(crate) recovery: Option<&'a LongRateLimitRetryState>,
+}
+
+impl<T: HttpTransport> HttpTransport for RateLimitRecoveryTransport<'_, T> {
+    async fn execute(&self, req: Request) -> Result<Response, TransportError> {
+        if let Some(recovery) = self.recovery {
+            recovery
+                .before_attempt()
+                .await
+                .map_err(|_| TransportError::RetryLimit)?;
+        }
+        self.inner.execute(req).await
+    }
+
+    async fn stream(&self, req: Request) -> Result<StreamResponse, TransportError> {
+        if let Some(recovery) = self.recovery {
+            recovery
+                .before_attempt()
+                .await
+                .map_err(|_| TransportError::RetryLimit)?;
+        }
+        self.inner.stream(req).await
+    }
+}
+
+fn is_temporary_rate_limit(err: &CodexErr) -> bool {
+    matches!(err.details(), CodexErrorDetails::RateLimitExceeded(_))
+        || matches!(err.details(), CodexErrorDetails::RetryLimit(error) if error.status.as_u16() == 429)
+}
+
+pub(crate) fn can_retry_during_rate_limit_recovery(err: &CodexErr) -> bool {
+    if is_temporary_rate_limit(err) {
+        return true;
+    }
+    match err.details() {
+        CodexErrorDetails::Stream(_)
+        | CodexErrorDetails::ConnectionFailed(_)
+        | CodexErrorDetails::ResponseStreamFailed(_)
+        | CodexErrorDetails::RequestTimeout
+        | CodexErrorDetails::Timeout
+        | CodexErrorDetails::InternalServerError => err
+            .http_status_code_value()
+            .is_none_or(|status| (500..600).contains(&status)),
+        CodexErrorDetails::UnexpectedStatus(error) => error.status.is_server_error(),
+        CodexErrorDetails::ServerOverloaded | CodexErrorDetails::PolicyCapacityUnavailable => {
+            err.retry_after().is_some()
+        }
+        _ => false,
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ResponsesStreamRequest {
@@ -39,6 +227,10 @@ pub(crate) fn is_terminal_sampling_outcome(error: &CodexErr) -> bool {
             | CodexErrorDetails::UsageAccountingFailed(_)
             | CodexErrorDetails::SessionBudgetExceeded
             | CodexErrorDetails::APISpendLimitExceeded(_)
+            | CodexErrorDetails::QuotaExceeded
+            | CodexErrorDetails::UsageNotIncluded
+            | CodexErrorDetails::UsageLimitReached(_)
+            | CodexErrorDetails::RateLimitRecoveryExhausted(_)
             | CodexErrorDetails::InferenceHookDenied { .. }
     )
 }
@@ -69,8 +261,78 @@ pub(crate) struct ExhaustedResponseRetry {
 /// Returns `Ok(())` when the caller should retry the request loop, or the original error when
 /// it is terminal or the retry budget is exhausted.
 #[tracing::instrument(level = "trace", skip_all, fields(request = ?request))]
-pub(crate) async fn handle_response_stream_error(
+pub(crate) fn handle_response_stream_error(
     retry_state: &mut ResponsesStreamRetryState,
+    max_retries: u64,
+    err: CodexErr,
+    client_session: &mut ModelClientSession,
+    sess: &Session,
+    step_context: &StepContext,
+    request: ResponsesStreamRequest,
+) -> impl std::future::Future<Output = Result<(), CodexErr>> {
+    let turn_context = &step_context.turn;
+    let retry_count = retry_state.retries.saturating_add(1);
+    let enabled = turn_context
+        .config
+        .features
+        .enabled(Feature::LongRateLimitRetries);
+    let normal_retry_available =
+        retry_state.retries < max_retries && err.retry_delay(retry_count).is_some();
+    // Ordinary WebSocket-to-HTTP fallback has its own retry budget; consume it before recovery.
+    let normal_fallback_switched = !client_session.long_rate_limit_retry.is_active()
+        && enabled
+        && is_temporary_rate_limit(&err)
+        && !normal_retry_available
+        && err.retry_delay(retry_count).is_some()
+        && client_session.try_switch_fallback_transport(
+            &turn_context.session_telemetry,
+            turn_context.model_info(),
+        );
+    if normal_fallback_switched {
+        retry_state.retries = 0;
+    }
+    // Latch the deadline before the cancellable future is polled: an already queued steer may
+    // otherwise cancel the wait before its first poll and immediately submit another request.
+    let long_retry_at = client_session.long_rate_limit_retry.schedule_if_needed(
+        &err,
+        enabled,
+        normal_retry_available || normal_fallback_switched,
+    );
+    async move {
+        // Recovery owns every later retry, before fallback or unbounded connection retries can
+        // restore a fast loop. Background compaction does not use this handler.
+        if client_session.long_rate_limit_retry.is_active() {
+            let Some(retry_at) = long_retry_at else {
+                return Err(err);
+            };
+            let operation = match request {
+                ResponsesStreamRequest::Sampling => RetryOperation::Sampling,
+                ResponsesStreamRequest::RemoteCompactionV2 => RetryOperation::RemoteCompactionV2,
+            };
+            let delay = retry_at.saturating_duration_since(Instant::now());
+            codex_client::record_retry!(retry_count, delay, operation);
+            return client_session
+                .long_rate_limit_retry
+                .wait_after_error(sess, turn_context, err, retry_at)
+                .await;
+        }
+        handle_standard_response_stream_error(
+            retry_state,
+            normal_fallback_switched,
+            max_retries,
+            err,
+            client_session,
+            sess,
+            step_context,
+            request,
+        )
+        .await
+    }
+}
+
+async fn handle_standard_response_stream_error(
+    retry_state: &mut ResponsesStreamRetryState,
+    normal_fallback_switched: bool,
     max_retries: u64,
     err: CodexErr,
     client_session: &mut ModelClientSession,
@@ -133,11 +395,12 @@ pub(crate) async fn handle_response_stream_error(
     }
 
     let requires_http_fallback = err.requires_http_fallback();
-    let switched = (requires_http_fallback || retry_state.retries >= max_retries)
-        && client_session.try_switch_fallback_transport(
-            &turn_context.session_telemetry,
-            turn_context.model_info(),
-        );
+    let switched = normal_fallback_switched
+        || ((requires_http_fallback || retry_state.retries >= max_retries)
+            && client_session.try_switch_fallback_transport(
+                &turn_context.session_telemetry,
+                turn_context.model_info(),
+            ));
     if switched {
         // Changing transport must not bypass the server's retry deadline.
         if let Some(retry_after) = retry_after {

@@ -148,7 +148,11 @@ async fn build_and_install_compaction(
             Ok(attempt) => (attempt, turn_context),
             Err(error) => {
                 let fallback_turn_context = &replacement_step_context.turn;
-                if !should_retry_with_current_model(&error, turn_context, fallback_turn_context) {
+                if client_session
+                    .as_ref()
+                    .is_some_and(|session| session.long_rate_limit_retry.is_active())
+                    || !should_retry_with_current_model(&error, turn_context, fallback_turn_context)
+                {
                     return Err(error);
                 }
                 sess.set_last_known_step_context(replacement_step_context)

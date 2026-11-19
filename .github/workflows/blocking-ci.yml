@@ -7,10 +7,12 @@ on:
   push:
     branches: [main]
 
+# Fork: the focused checks live in fork-ci.yml.
 jobs:
   # Keep reusable workflow calls alphabetized. The `required` job below is the
   # version-controlled list that the main-branch ruleset should require.
   bazel:
+    if: github.repository == 'openai/codex'
     permissions:
       contents: read
       id-token: write
@@ -21,7 +23,7 @@ jobs:
   bazel-result:
     name: Bazel result
     needs: bazel
-    if: ${{ always() }}
+    if: ${{ github.repository == 'openai/codex' && always() }}
     runs-on: ubuntu-24.04
     steps:
       - name: Require the Bazel workflow to succeed
@@ -30,26 +32,31 @@ jobs:
         run: test "$BAZEL_RESULT" = success
 
   blob-size-policy:
+    if: github.repository == 'openai/codex'
     name: Blob size policy
     uses: ./.github/workflows/blob-size-policy.yml
     secrets: inherit
 
   cargo-deny:
+    if: github.repository == 'openai/codex'
     name: cargo-deny
     uses: ./.github/workflows/cargo-deny.yml
     secrets: inherit
 
   codespell:
+    if: github.repository == 'openai/codex'
     name: Codespell
     uses: ./.github/workflows/codespell.yml
     secrets: inherit
 
   repo-checks:
+    if: github.repository == 'openai/codex'
     name: repo-checks
     uses: ./.github/workflows/repo-checks.yml
     secrets: inherit
 
   rust-ci:
+    if: github.repository == 'openai/codex'
     permissions:
       contents: read
       id-token: write
@@ -58,6 +65,7 @@ jobs:
     secrets: inherit
 
   sdk:
+    if: github.repository == 'openai/codex'
     permissions:
       contents: read
       id-token: write
@@ -69,7 +77,7 @@ jobs:
     name: CI required
     # Without `always()`, GitHub skips this job after a failed dependency and a
     # required check can appear successful instead of reporting the failure.
-    if: ${{ always() }}
+    if: ${{ github.repository == 'openai/codex' && always() }}
     needs:
       - blob-size-policy
       - cargo-deny

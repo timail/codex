@@ -1195,6 +1195,9 @@
             "login_shell_package_path": {
               "type": "boolean"
             },
+            "long_rate_limit_retries": {
+              "type": "boolean"
+            },
             "mcp_2026_07_28": {
               "type": "boolean"
             },
@@ -8561,6 +8564,9 @@
           "type": "boolean"
         },
         "login_shell_package_path": {
+          "type": "boolean"
+        },
+        "long_rate_limit_retries": {
           "type": "boolean"
         },
         "mcp_2026_07_28": {

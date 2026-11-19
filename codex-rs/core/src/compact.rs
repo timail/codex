@@ -43,6 +43,7 @@ use codex_async_utils::OrCancelExt;
 use codex_context_fragments::AnnotatedContent;
 use codex_context_fragments::set_annotated_content;
 use codex_context_fragments::truncate_annotated_text;
+use codex_features::Feature;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
 use codex_http_client::RetryAfter;
@@ -124,6 +125,7 @@ pub(crate) async fn run_inline_auto_compact_task(
     sess: Arc<Session>,
     step_context: Arc<StepContext>,
     replacement_step_context: Arc<StepContext>,
+    client_session: &mut ModelClientSession,
     world_state: Arc<WorldState>,
     reason: CompactionReason,
     phase: CompactionPhase,
@@ -141,6 +143,7 @@ pub(crate) async fn run_inline_auto_compact_task(
         sess,
         step_context,
         replacement_step_context,
+        Some(client_session),
         input,
         world_state,
         CompactionTurnMetadata::new(
@@ -163,6 +166,7 @@ pub(crate) async fn run_compact_task(
         sess.clone(),
         Arc::clone(&step_context),
         step_context,
+        None,
         input,
         world_state,
         CompactionTurnMetadata::new(
@@ -180,6 +184,7 @@ async fn run_compact_task_inner(
     sess: Arc<Session>,
     step_context: Arc<StepContext>,
     replacement_step_context: Arc<StepContext>,
+    client_session: Option<&mut ModelClientSession>,
     input: Vec<ResolvedUserInput>,
     world_state: Arc<WorldState>,
     compaction_metadata: CompactionTurnMetadata,
@@ -217,6 +222,7 @@ async fn run_compact_task_inner(
         Arc::clone(&sess),
         step_context,
         replacement_step_context,
+        client_session,
         input,
         world_state,
         compaction_metadata,
@@ -268,6 +274,7 @@ async fn run_compact_task_inner_impl(
     sess: Arc<Session>,
     step_context: Arc<StepContext>,
     replacement_step_context: Arc<StepContext>,
+    client_session: Option<&mut ModelClientSession>,
     input: Vec<ResolvedUserInput>,
     world_state: Arc<WorldState>,
     compaction_metadata: CompactionTurnMetadata,
@@ -306,7 +313,18 @@ async fn run_compact_task_inner_impl(
     let mut retries = 0;
     // Reuse one client session so turn-scoped state (sticky routing and websocket incremental
     // request tracking) survives retries within this compact turn.
-    let mut client_session = sess.services.model_client.new_session();
+    // Opt-in inline compaction shares the foreground gate so steering into compaction cannot
+    // skip an active outage. Keep the upstream independent session when the feature is disabled.
+    let mut owned_client_session = None;
+    let client_session = client_session
+        .filter(|session| {
+            session.long_rate_limit_retry.is_active()
+                || turn_context
+                    .config
+                    .features
+                    .enabled(Feature::LongRateLimitRetries)
+        })
+        .unwrap_or_else(|| owned_client_session.insert(sess.services.model_client.new_session()));
     let compaction_response = loop {
         // Clone is required because of the loop
         let mut turn_input = history
@@ -345,13 +363,38 @@ async fn run_compact_task_inner_impl(
             &mut request,
             &sess,
             &step_context,
-            &mut client_session,
+            client_session,
             &responses_metadata,
             &Arc::new(prompt),
             compaction_metadata.phase(),
         )
         .await;
 
+        let attempt_result = match attempt_result {
+            Err(err) => {
+                let retry_at = client_session.long_rate_limit_retry.schedule_if_needed(
+                    &err,
+                    turn_context
+                        .config
+                        .features
+                        .enabled(Feature::LongRateLimitRetries),
+                    retries < max_retries && err.retry_delay(retries.saturating_add(1)).is_some(),
+                );
+                if client_session.long_rate_limit_retry.is_active() {
+                    let Some(retry_at) = retry_at else {
+                        return Err(err);
+                    };
+                    client_session
+                        .long_rate_limit_retry
+                        .wait_after_error(&sess, &turn_context, err, retry_at)
+                        .or_cancel(&step_context.turn_cancellation)
+                        .await??;
+                    continue;
+                }
+                Err(err)
+            }
+            result => result,
+        };
         match attempt_result {
             Ok(response) => {
                 break response;
@@ -384,7 +427,9 @@ async fn run_compact_task_inner_impl(
                 let retry_at = retry_after
                     .map(RetryAfter::deadline)
                     .unwrap_or_else(|| tokio::time::Instant::now() + delay);
-                tokio::time::sleep_until(retry_at).await;
+                tokio::time::sleep_until(retry_at)
+                    .or_cancel(&step_context.turn_cancellation)
+                    .await?;
             }
             Err(e) => return Err(e),
         }
@@ -403,6 +448,7 @@ async fn run_compact_task_inner_impl(
         get_last_assistant_message_from_turn(history_snapshot.raw_items()).unwrap_or_default()
     };
     let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
+    client_session.long_rate_limit_retry.finish_response();
 
     let mut new_history = build_compacted_history(&history_snapshot, &summary_text);
     if let Some(summary_item) = new_history.last_mut() {
