@@ -42,11 +42,6 @@ pub enum ApiError {
         message: String,
         retry_after: Option<RetryAfter>,
     },
-    #[error("rate limit exceeded: {message}")]
-    RateLimitExceeded {
-        message: String,
-        retry_after: Option<RetryAfter>,
-    },
     #[error("rate limit: {0}")]
     RateLimit(String),
     #[error("invalid request: {message}")]
@@ -113,7 +108,10 @@ pub(crate) fn parse_terminal_provider_error(
     for (kind, scope) in [
         ("api_key_spend_limit_exceeded", SpendLimitScope::ApiKey),
         ("project_spend_limit_exceeded", SpendLimitScope::Project),
-        ("organization_spend_limit_exceeded", SpendLimitScope::Organization),
+        (
+            "organization_spend_limit_exceeded",
+            SpendLimitScope::Organization,
+        ),
     ] {
         if provider_error_matches(error, &[kind]) {
             return Some(ApiError::SpendLimitExceeded(scope));
@@ -137,8 +135,6 @@ pub(crate) fn parse_terminal_provider_error(
         .and_then(Value::as_str)
         .filter(|message| !message.trim().is_empty());
     match (code, status) {
-        ("insufficient_quota" | "credit_balance_exhausted", None) => Some(ApiError::QuotaExceeded),
-        ("usage_not_included", None) => Some(ApiError::UsageNotIncluded),
         ("invalid_prompt", None) => Some(ApiError::InvalidPrompt {
             message: error
                 .get("message")
@@ -154,16 +150,6 @@ pub(crate) fn parse_terminal_provider_error(
                 serde_json::from_value::<MisalignmentErrorDetails>(details).ok()
             }),
         }),
-        ("api_key_spend_limit_exceeded", None | Some(StatusCode::TOO_MANY_REQUESTS)) => {
-            Some(ApiError::SpendLimitExceeded(SpendLimitScope::ApiKey))
-        }
-        ("project_spend_limit_exceeded", None | Some(StatusCode::TOO_MANY_REQUESTS)) => {
-            Some(ApiError::SpendLimitExceeded(SpendLimitScope::Project))
-        }
-        ("organization_spend_limit_exceeded", None | Some(StatusCode::TOO_MANY_REQUESTS)) => {
-            Some(ApiError::SpendLimitExceeded(SpendLimitScope::Organization))
-        }
-
         ("inference_hook_denied", None | Some(StatusCode::FORBIDDEN)) => {
             Some(ApiError::InferenceHookDenied {
                 message: message

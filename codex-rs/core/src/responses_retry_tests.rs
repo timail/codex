@@ -471,3 +471,82 @@ async fn long_retry_keeps_server_errors_slow_and_hard_errors_terminal() {
         assert_eq!(Instant::now(), after_wait);
     }
 }
+
+#[test_case::test_case(ResponsesStreamRequest::Sampling; "sampling")]
+#[test_case::test_case(ResponsesStreamRequest::RemoteCompactionV2; "compaction")]
+#[tokio::test]
+async fn long_retry_preserves_normal_websocket_fallback_before_starting_the_window(
+    request: ResponsesStreamRequest,
+) {
+    let (session, turn_context, _events) =
+        crate::session::tests::make_session_and_context_with_auth_and_config_and_rx(
+            codex_login::CodexAuth::from_api_key("Test API Key"),
+            Vec::new(),
+            |config| {
+                config.model_provider.supports_websockets = true;
+                config
+                    .features
+                    .enable(Feature::LongRateLimitRetries)
+                    .unwrap();
+            },
+        )
+        .await;
+    let step_context = StepContext::for_test(turn_context);
+    let mut client_session = session.services.model_client.new_session();
+    let mut retry_state = ResponsesStreamRetryState {
+        retries: 1,
+        ..Default::default()
+    };
+    let rate_limit = || CodexErr::new(CodexErrorDetails::RateLimitExceeded("throttled".into()));
+    assert!(session.services.model_client.responses_websocket_enabled());
+    tokio::time::pause();
+    let started = Instant::now();
+    let advice = RetryAfter::from_delay(Duration::from_secs(7)).unwrap();
+    handle_response_stream_error(
+        &mut retry_state,
+        1,
+        rate_limit().with_retry_after(advice),
+        &mut client_session,
+        &session,
+        &step_context,
+        request,
+    )
+    .await
+    .unwrap();
+    assert!(!session.services.model_client.responses_websocket_enabled());
+    assert!(!client_session.long_rate_limit_retry.is_active());
+    assert_eq!(retry_state.retries, 0);
+    assert!(Instant::now() - started >= Duration::from_secs(7));
+    assert!(Instant::now() - started < Duration::from_secs(8));
+    // The fallback transport retains its ordinary budget before the 30-minute recovery wait.
+    handle_response_stream_error(
+        &mut retry_state,
+        1,
+        rate_limit(),
+        &mut client_session,
+        &session,
+        &step_context,
+        request,
+    )
+    .await
+    .unwrap();
+    assert_eq!(retry_state.retries, 1);
+    assert!(!client_session.long_rate_limit_retry.is_active());
+    let before_recovery = Instant::now();
+    handle_response_stream_error(
+        &mut retry_state,
+        1,
+        rate_limit(),
+        &mut client_session,
+        &session,
+        &step_context,
+        request,
+    )
+    .await
+    .unwrap();
+    assert!(client_session.long_rate_limit_retry.is_active());
+    assert!(Instant::now() - before_recovery >= LONG_RATE_LIMIT_RETRY_INTERVAL);
+    assert!(
+        Instant::now() - before_recovery < LONG_RATE_LIMIT_RETRY_INTERVAL + Duration::from_secs(1)
+    );
+}

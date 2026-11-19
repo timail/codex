@@ -126,6 +126,7 @@ async fn terminal_failure_with_retry_header_ends_stream_immediately() {
             CodexErrorInfo::ProjectSpendLimitExceeded,
         ),
         (
+            "api_key_spend_limit_exceeded",
             "organization_spend_limit_exceeded",
             CodexErrorInfo::OrganizationSpendLimitExceeded,
         ),
@@ -488,8 +489,12 @@ async fn streamed_terminal_limit_markers_override_rate_limit_status_and_headers(
                 );
                 let expected = if marker == "budget_reached" {
                     CodexErrorInfo::SessionBudgetExceeded
-                } else if matches!(marker, "organization_spend_limit_exceeded" | "project_spend_limit_exceeded") {
-                    CodexErrorInfo::SpendLimitExceeded
+                } else if marker == "api_key_spend_limit_exceeded" {
+                    CodexErrorInfo::ApiKeySpendLimitExceeded
+                } else if marker == "organization_spend_limit_exceeded" {
+                    CodexErrorInfo::OrganizationSpendLimitExceeded
+                } else if marker == "project_spend_limit_exceeded" {
+                    CodexErrorInfo::ProjectSpendLimitExceeded
                 } else {
                     CodexErrorInfo::UsageLimitExceeded
                 };
@@ -589,7 +594,10 @@ fn streamed_rate_limit_classification_respects_explicit_nonrate_status_and_code(
         .unwrap();
         let result = process_responses_event(event);
         if code == "server_is_overloaded" {
-            assert!(matches!(result.unwrap_err().into_api_error(), ApiError::ServerOverloaded { .. }));
+            assert!(matches!(
+                result.unwrap_err().into_api_error(),
+                ApiError::ServerOverloaded { .. }
+            ));
         } else {
             assert!(matches!(
                 result.unwrap_err().into_api_error(),

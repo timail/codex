@@ -272,15 +272,31 @@ pub(crate) fn handle_response_stream_error(
 ) -> impl std::future::Future<Output = Result<(), CodexErr>> {
     let turn_context = &step_context.turn;
     let retry_count = retry_state.retries.saturating_add(1);
+    let enabled = turn_context
+        .config
+        .features
+        .enabled(Feature::LongRateLimitRetries);
+    let normal_retry_available =
+        retry_state.retries < max_retries && err.retry_delay(retry_count).is_some();
+    // Ordinary WebSocket-to-HTTP fallback has its own retry budget; consume it before recovery.
+    let normal_fallback_switched = !client_session.long_rate_limit_retry.is_active()
+        && enabled
+        && is_temporary_rate_limit(&err)
+        && !normal_retry_available
+        && err.retry_delay(retry_count).is_some()
+        && client_session.try_switch_fallback_transport(
+            &turn_context.session_telemetry,
+            turn_context.model_info(),
+        );
+    if normal_fallback_switched {
+        retry_state.retries = 0;
+    }
     // Latch the deadline before the cancellable future is polled: an already queued steer may
     // otherwise cancel the wait before its first poll and immediately submit another request.
     let long_retry_at = client_session.long_rate_limit_retry.schedule_if_needed(
         &err,
-        turn_context
-            .config
-            .features
-            .enabled(Feature::LongRateLimitRetries),
-        retry_state.retries < max_retries && err.retry_delay(retry_count).is_some(),
+        enabled,
+        normal_retry_available || normal_fallback_switched,
     );
     async move {
         // Recovery owns every later retry, before fallback or unbounded connection retries can
@@ -302,6 +318,7 @@ pub(crate) fn handle_response_stream_error(
         }
         handle_standard_response_stream_error(
             retry_state,
+            normal_fallback_switched,
             max_retries,
             err,
             client_session,
@@ -315,6 +332,7 @@ pub(crate) fn handle_response_stream_error(
 
 async fn handle_standard_response_stream_error(
     retry_state: &mut ResponsesStreamRetryState,
+    normal_fallback_switched: bool,
     max_retries: u64,
     err: CodexErr,
     client_session: &mut ModelClientSession,
@@ -377,11 +395,12 @@ async fn handle_standard_response_stream_error(
     }
 
     let requires_http_fallback = err.requires_http_fallback();
-    let switched = (requires_http_fallback || retry_state.retries >= max_retries)
-        && client_session.try_switch_fallback_transport(
-            &turn_context.session_telemetry,
-            turn_context.model_info(),
-        );
+    let switched = normal_fallback_switched
+        || ((requires_http_fallback || retry_state.retries >= max_retries)
+            && client_session.try_switch_fallback_transport(
+                &turn_context.session_telemetry,
+                turn_context.model_info(),
+            ));
     if switched {
         // Changing transport must not bypass the server's retry deadline.
         if let Some(retry_after) = retry_after {

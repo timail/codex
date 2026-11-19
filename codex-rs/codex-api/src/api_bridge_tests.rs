@@ -649,6 +649,7 @@ async fn http_terminal_limit_markers_override_retry_advice_and_malformed_details
         for marker in [
             "insufficient_quota",
             "credit_balance_exhausted",
+            "api_key_spend_limit_exceeded",
             "organization_spend_limit_exceeded",
             "project_spend_limit_exceeded",
             "organization_usage_limit_exceeded",
@@ -677,6 +678,12 @@ async fn http_terminal_limit_markers_override_retry_advice_and_malformed_details
                 }));
                 let expected = if marker == "budget_reached" {
                     CodexErrorInfo::SessionBudgetExceeded
+                } else if marker == "api_key_spend_limit_exceeded" {
+                    CodexErrorInfo::ApiKeySpendLimitExceeded
+                } else if marker == "organization_spend_limit_exceeded" {
+                    CodexErrorInfo::OrganizationSpendLimitExceeded
+                } else if marker == "project_spend_limit_exceeded" {
+                    CodexErrorInfo::ProjectSpendLimitExceeded
                 } else {
                     CodexErrorInfo::UsageLimitExceeded
                 };

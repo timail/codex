@@ -12,7 +12,6 @@ use crate::safety_buffering::treatment_from_headers;
 use crate::telemetry::SseTelemetry;
 use codex_client::ByteStream;
 use codex_client::StreamResponse;
-use codex_client::TransportError;
 use codex_protocol::ResponseUsageMetadata;
 use codex_protocol::error::ResponseIncompleteError;
 use codex_protocol::models::ResponseItem;

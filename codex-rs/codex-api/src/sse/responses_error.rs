@@ -125,8 +125,9 @@ pub(super) fn parse_error_event(
             retry_after,
         }));
     }
-    if let Some(code @ ("policy_capacity_unavailable" | "server_is_overloaded")) =
-        error.and_then(|error| error.get("code")).and_then(Value::as_str)
+    if let Some(code @ ("policy_capacity_unavailable" | "server_is_overloaded")) = error
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
     {
         let retry_after = retry_after_header(error.and_then(|error| error.get("headers")))
             .or_else(|| retry_after_header(headers));
