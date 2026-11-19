@@ -166,7 +166,6 @@ async fn foreground_compaction_stays_slow_after_500_and_cancels(remote: bool) ->
             responses::sse_response(responses::sse_completed("before-compact")),
             ResponseTemplate::new(429),
             ResponseTemplate::new(500),
-            responses::sse_response(responses::sse_completed("unexpected-after-cancel")),
         ],
     )
     .await;
@@ -192,6 +191,17 @@ async fn foreground_compaction_stays_slow_after_500_and_cancels(remote: bool) ->
     .await;
     advance_retry_clock(RETRY_INTERVAL + Duration::from_secs(1)).await;
     assert_eq!(mock.requests().len(), 3);
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/v1/responses")
+            .count(),
+        3,
+        "cancellation must prevent even unmatched requests"
+    );
     test.codex.shutdown_and_wait().await?;
     Ok(())
 }
@@ -207,7 +217,6 @@ async fn foreground_compaction_caps_retry_after_at_the_outage_deadline(remote: b
         vec![
             responses::sse_response(responses::sse_completed("before-compact")),
             ResponseTemplate::new(429).insert_header("Retry-After", "46800"),
-            responses::sse_response(responses::sse_completed("unexpected-after-expiry")),
         ],
     )
     .await;
@@ -227,6 +236,17 @@ async fn foreground_compaction_caps_retry_after_at_the_outage_deadline(remote: b
         2,
         "expiry must not start another request or fallback"
     );
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/v1/responses")
+            .count(),
+        2,
+        "expiry must prevent even unmatched requests"
+    );
     test.codex.shutdown_and_wait().await?;
     Ok(())
 }
@@ -242,7 +262,6 @@ async fn http_and_sse_recovery_never_burst_and_interrupt_cancels_the_wait() -> R
                 .set_body_json(json!({"error": {"type": "throttling_error", "code": "429"}})),
             ResponseTemplate::new(500),
             responses::sse_response(responses::sse(vec![failed_rate_limit()])),
-            responses::sse_response(responses::sse_completed("unexpected-after-cancel")),
         ],
     )
     .await;
@@ -271,6 +290,17 @@ async fn http_and_sse_recovery_never_burst_and_interrupt_cancels_the_wait() -> R
     .await;
     advance_retry_clock(RETRY_INTERVAL + Duration::from_secs(1)).await;
     assert_eq!(mock.requests().len(), 3);
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/v1/responses")
+            .count(),
+        3,
+        "cancellation must prevent even unmatched requests"
+    );
     test.codex.shutdown_and_wait().await?;
     Ok(())
 }
