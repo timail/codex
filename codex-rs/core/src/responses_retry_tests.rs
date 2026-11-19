@@ -327,14 +327,22 @@ async fn long_retry_is_opt_in_and_preserves_the_normal_retry_budget(
         .is_err()
     );
     assert!(!client_session.long_rate_limit_retry.is_active());
-    let (session, mut turn_context) = make_session_and_context().await;
+    let (session, turn_context, _events) =
+        crate::session::tests::make_session_and_context_with_auth_and_config_and_rx(
+            codex_login::CodexAuth::from_api_key("Test API Key"),
+            Vec::new(),
+            |config| {
+                config.model_provider.supports_websockets = false;
+                config
+                    .features
+                    .enable(Feature::LongRateLimitRetries)
+                    .unwrap();
+            },
+        )
+        .await;
     let mut client_session = session.services.model_client.new_session();
     let mut retry_state = ResponsesStreamRetryState::default();
-    Arc::make_mut(&mut turn_context.config)
-        .features
-        .enable(Feature::LongRateLimitRetries)
-        .expect("enable long retries");
-    let step_context = StepContext::for_test(Arc::new(turn_context));
+    let step_context = StepContext::for_test(turn_context);
     tokio::time::pause();
     let started = Instant::now();
     let stream_rate_limit =
