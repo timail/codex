@@ -4,6 +4,7 @@ use super::process_responses_event;
 use super::spawn_response_stream;
 use crate::api_bridge::map_api_error;
 use crate::common::ResponseEvent;
+use crate::error::ApiError;
 use bytes::Bytes;
 use codex_client::StreamResponse;
 use codex_http_client::RetryAfter;
@@ -126,7 +127,6 @@ async fn terminal_failure_with_retry_header_ends_stream_immediately() {
             CodexErrorInfo::ProjectSpendLimitExceeded,
         ),
         (
-            "api_key_spend_limit_exceeded",
             "organization_spend_limit_exceeded",
             CodexErrorInfo::OrganizationSpendLimitExceeded,
         ),
@@ -460,6 +460,7 @@ async fn streamed_terminal_limit_markers_override_rate_limit_status_and_headers(
         for marker in [
             "insufficient_quota",
             "credit_balance_exhausted",
+            "api_key_spend_limit_exceeded",
             "organization_spend_limit_exceeded",
             "project_spend_limit_exceeded",
             "organization_usage_limit_exceeded",

@@ -40,8 +40,14 @@ fn retry_after_header(headers: Option<&Value>) -> Option<RetryAfter> {
 
 pub(super) fn parse_failed_response(response: Option<Value>) -> ApiError {
     let error = response.as_ref().and_then(|response| response.get("error"));
-    if let Some(error) = parse_error_event(error, /*headers*/ None, /*status*/ None) {
-        return error;
+    // Keep upstream validation of optional fields for non-rate overload failures.
+    if let Some(parsed) = parse_error_event(error, /*headers*/ None, /*status*/ None)
+        && !matches!(
+            parsed,
+            ApiError::ServerOverloaded { .. } | ApiError::PolicyCapacityUnavailable { .. }
+        )
+    {
+        return parsed;
     }
     let retry_after_header = error
         .and_then(|error| error.get("headers"))
