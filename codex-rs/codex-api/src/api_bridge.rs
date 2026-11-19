@@ -1,5 +1,6 @@
 use crate::TransportError;
 use crate::error::ApiError;
+use crate::error::auth_error_status;
 use crate::error::parse_terminal_provider_error;
 use crate::error::provider_error_matches;
 use crate::rate_limits::parse_promo_message;
@@ -151,6 +152,11 @@ fn map_api_error_details(err: ApiError) -> CodexErr {
                 if let Some(error) = parse_terminal_provider_error(provider_error, Some(status)) {
                     return map_api_error_details(error);
                 }
+                let status = if status == http::StatusCode::TOO_MANY_REQUESTS {
+                    provider_error.and_then(auth_error_status).unwrap_or(status)
+                } else {
+                    status
+                };
 
                 if status == http::StatusCode::SERVICE_UNAVAILABLE
                     && let Some(error) = provider_error

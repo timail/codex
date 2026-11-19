@@ -699,6 +699,75 @@ async fn http_terminal_limit_markers_override_retry_advice_and_malformed_details
 }
 
 #[test]
+fn http_429_auth_markers_keep_request_diagnostics() {
+    for (marker, status) in [("authentication_error", 401), ("permission_denied", 403)] {
+        for field in ["code", "type", "litellm_error_type"] {
+            let mut detail = serde_json::json!({"type": "throttling_error", "code": "429"});
+            detail[field] = marker.into();
+            let body = serde_json::json!({"error": detail}).to_string();
+            let url = "https://example.test/v1/responses";
+            let error = map_api_error(ApiError::Transport(TransportError::Http {
+                status: http::StatusCode::TOO_MANY_REQUESTS,
+                url: Some(url.into()),
+                headers: Some(HeaderMap::from_iter([(
+                    http::HeaderName::from_static("x-request-id"),
+                    http::HeaderValue::from_static("req-auth"),
+                )])),
+                body: Some(body.clone()),
+                retry_after: RetryAfter::from_delay(std::time::Duration::from_secs(3600)),
+            }));
+            let CodexErrorDetails::UnexpectedStatus(details) = error.details() else {
+                panic!("expected an auth failure for {field}={marker}, got {error}");
+            };
+            assert_eq!(details.status.as_u16(), status);
+            assert_eq!(details.body, body);
+            assert_eq!(details.url.as_deref(), Some(url));
+            assert_eq!(details.request_id.as_deref(), Some("req-auth"));
+            assert!(error.retry_after().is_some());
+        }
+    }
+}
+
+#[test]
+fn http_and_sse_429_policy_markers_override_throttling_fields() {
+    for marker in [
+        "cyber_policy",
+        "bio_policy",
+        "inference_hook_denied",
+        "content_policy_violation",
+        "misalignment_policy_violation",
+        "invalid_prompt",
+        "access_program_not_enabled",
+    ] {
+        for field in ["code", "type", "litellm_error_type"] {
+            let mut detail = serde_json::json!({"type": "throttling_error", "code": "429"});
+            detail[field] = marker.into();
+            let http = ApiError::Transport(TransportError::Http {
+                status: http::StatusCode::TOO_MANY_REQUESTS,
+                url: None,
+                headers: None,
+                body: Some(serde_json::json!({"error": detail}).to_string()),
+                retry_after: RetryAfter::from_delay(std::time::Duration::from_secs(3600)),
+            });
+            let event = serde_json::from_value(serde_json::json!({
+                "type": "error", "status": 429, "error": detail
+            }))
+            .unwrap();
+            let sse = crate::sse::process_responses_event(event)
+                .unwrap_err()
+                .into_api_error();
+            for error in [http, sse].map(map_api_error) {
+                assert_eq!(
+                    error.retry_delay(/*retry_count*/ 1),
+                    None,
+                    "{field}={marker}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn http_usage_limit_keeps_valid_details_when_another_field_is_malformed() {
     let error = map_api_error(ApiError::Transport(TransportError::Http {
         status: http::StatusCode::TOO_MANY_REQUESTS,

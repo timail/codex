@@ -2,6 +2,7 @@
 //! Only rate-limit errors derive retry delays from plaintext messages.
 
 use crate::error::ApiError;
+use crate::error::auth_error_status;
 use crate::error::parse_terminal_provider_error;
 use crate::error::provider_error_matches;
 use crate::responses_headers::json_headers_to_http_headers;
@@ -192,37 +193,6 @@ fn http_error_status(value: &Value) -> Option<StatusCode> {
                 .and_then(|value| StatusCode::from_bytes(value.as_bytes()).ok())
         })?;
     (status.is_client_error() || status.is_server_error()).then_some(status)
-}
-
-fn auth_error_status(error: &Value) -> Option<StatusCode> {
-    if provider_error_matches(
-        error,
-        &[
-            "invalid_api_key",
-            "authentication_error",
-            "auth_error",
-            "token_not_found_in_db",
-            "expired_key",
-        ],
-    ) {
-        Some(StatusCode::UNAUTHORIZED)
-    } else if provider_error_matches(
-        error,
-        &[
-            "permission_error",
-            "permission_denied",
-            "key_model_access_denied",
-            "team_model_access_denied",
-            "user_model_access_denied",
-            "org_model_access_denied",
-            "project_model_access_denied",
-            "tool_access_denied",
-        ],
-    ) {
-        Some(StatusCode::FORBIDDEN)
-    } else {
-        None
-    }
 }
 
 fn is_rate_limit_status(value: &Value) -> bool {

@@ -129,12 +129,29 @@ pub(crate) fn parse_terminal_provider_error(
     ) {
         return Some(ApiError::QuotaExceeded);
     }
-    let code = error.get("code")?.as_str()?;
+    // A proxy may label a policy rejection as 429 or put its code in the type field.
+    let policy_code = if matches!(status, None | Some(StatusCode::TOO_MANY_REQUESTS)) {
+        provider_error_kinds(error).find(|kind| {
+            matches!(
+                *kind,
+                "invalid_prompt"
+                    | "misalignment_policy_violation"
+                    | "inference_hook_denied"
+                    | "content_policy_violation"
+                    | "cyber_policy"
+                    | "bio_policy"
+                    | "access_program_not_enabled"
+            )
+        })
+    } else {
+        None
+    };
+    let code = policy_code.or_else(|| error.get("code")?.as_str())?;
     let message = error
         .get("message")
         .and_then(Value::as_str)
         .filter(|message| !message.trim().is_empty());
-    match (code, status) {
+    match (code, status.filter(|_| policy_code.is_none())) {
         ("invalid_prompt", None) => Some(ApiError::InvalidPrompt {
             message: error
                 .get("message")
@@ -192,9 +209,6 @@ pub(crate) fn parse_terminal_provider_error(
                 .unwrap_or("The requested access program is not enabled.")
                 .to_owned(),
         }),
-        ("budget_reached", None | Some(StatusCode::BAD_REQUEST)) => {
-            Some(ApiError::SessionBudgetExceeded)
-        }
         (
             "audio_too_large"
             | "audio_too_short"
@@ -221,11 +235,45 @@ pub(crate) fn parse_terminal_provider_error(
     }
 }
 
-pub(crate) fn provider_error_matches(error: &Value, kinds: &[&str]) -> bool {
+fn provider_error_kinds(error: &Value) -> impl Iterator<Item = &str> {
     ["code", "type", "litellm_error_type"]
         .into_iter()
         .filter_map(|field| error.get(field).and_then(Value::as_str))
-        .any(|kind| kinds.contains(&kind))
+}
+
+pub(crate) fn provider_error_matches(error: &Value, kinds: &[&str]) -> bool {
+    provider_error_kinds(error).any(|kind| kinds.contains(&kind))
+}
+
+pub(crate) fn auth_error_status(error: &Value) -> Option<StatusCode> {
+    if provider_error_matches(
+        error,
+        &[
+            "invalid_api_key",
+            "authentication_error",
+            "auth_error",
+            "token_not_found_in_db",
+            "expired_key",
+        ],
+    ) {
+        Some(StatusCode::UNAUTHORIZED)
+    } else if provider_error_matches(
+        error,
+        &[
+            "permission_error",
+            "permission_denied",
+            "key_model_access_denied",
+            "team_model_access_denied",
+            "user_model_access_denied",
+            "org_model_access_denied",
+            "project_model_access_denied",
+            "tool_access_denied",
+        ],
+    ) {
+        Some(StatusCode::FORBIDDEN)
+    } else {
+        None
+    }
 }
 
 impl From<crate::AuthError> for ApiError {
